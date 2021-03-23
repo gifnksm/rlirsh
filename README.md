@@ -1,5 +1,7 @@
 # rlirsh
 
+Rootless insecure remote shell.
+
 [![Crates.io](https://img.shields.io/crates/v/rlirsh.svg)](https://crates.io/crates/rlirsh)
 [![Docs.rs](https://docs.rs/rlirsh/badge.svg)](https://docs.rs/rlirsh)
 [![CI](https://github.com/gifnksm/rlirsh/workflows/Continuous%20Integration/badge.svg)](https://github.com/gifnksm/rlirsh/actions)
