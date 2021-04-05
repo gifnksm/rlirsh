@@ -80,7 +80,7 @@ fn init_tracing() {
     use tracing_error::ErrorLayer;
     use tracing_subscriber::{fmt, EnvFilter};
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .with(EnvFilter::from_default_env().add_directive(Level::INFO.into()))
         .with(ErrorLayer::default())
         .init();
