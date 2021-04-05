@@ -6,7 +6,7 @@ use std::{
     convert::TryFrom,
     env,
     ffi::OsString,
-    fmt::Debug,
+    fmt::{self, Debug},
     future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     os::unix::prelude::ExitStatusExt,
@@ -665,10 +665,40 @@ enum ClientAction {
     Finished,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 enum SourceAction {
     Data(Vec<u8>),
     SourceClosed,
+}
+
+impl Debug for SourceAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Bytes<'a>(&'a [u8]);
+        impl fmt::Debug for Bytes<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                const LENGTH: usize = 8;
+                for (idx, byte) in self.0.iter().take(LENGTH).enumerate() {
+                    if idx != 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{:02x}", byte)?;
+                }
+                if self.0.len() > LENGTH {
+                    write!(f, " ..")?;
+                }
+                Ok(())
+            }
+        }
+
+        match self {
+            SourceAction::Data(bytes) => f
+                .debug_struct("Data")
+                .field("len", &bytes.len())
+                .field("bytes", &Bytes(&bytes))
+                .finish(),
+            SourceAction::SourceClosed => f.debug_tuple("SourceClosed").finish(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
