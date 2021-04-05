@@ -1,7 +1,10 @@
 {
     "cSpell.words": [
+        "addrs",
         "argh",
         "bincode",
+        "oneshot",
+        "reuseaddr",
         "rlirsh",
         "subcommand"
     ]
