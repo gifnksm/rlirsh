@@ -7,6 +7,7 @@ use std::{
     env,
     ffi::OsString,
     fmt::Debug,
+    future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     os::unix::prelude::ExitStatusExt,
     process::Stdio,
@@ -14,7 +15,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
     process::Command,
     sync::{
@@ -210,9 +211,18 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
                 let message = recv_message(&mut reader).await.unwrap();
                 trace!(?message);
                 match message {
-                    ClientAction::Stdin(action) => stdin_action_tx.send(action).await.unwrap(),
-                    ClientAction::Stdout(action) => stdout_action_tx.send(action).await.unwrap(),
-                    ClientAction::Stderr(action) => stderr_action_tx.send(action).await.unwrap(),
+                    ClientAction::Stdin(action) => send_source_action(&stdin_action_tx, action)
+                        .instrument(info_span!("stdin_action_tx"))
+                        .await
+                        .unwrap(),
+                    ClientAction::Stdout(action) => send_sink_action(&stdout_action_tx, action)
+                        .instrument(info_span!("stdout_action_tx"))
+                        .await
+                        .unwrap(),
+                    ClientAction::Stderr(action) => send_sink_action(&stderr_action_tx, action)
+                        .instrument(info_span!("stderr_action_tx"))
+                        .await
+                        .unwrap(),
                     ClientAction::Finished => break,
                 }
             }
@@ -368,9 +378,18 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
                 let message = recv_message(&mut reader).await.unwrap();
                 trace!(?message);
                 match message {
-                    ServerAction::Stdin(action) => stdin_action_tx.send(action).await.unwrap(),
-                    ServerAction::Stdout(action) => stdout_action_tx.send(action).await.unwrap(),
-                    ServerAction::Stderr(action) => stderr_action_tx.send(action).await.unwrap(),
+                    ServerAction::Stdin(action) => send_sink_action(&stdin_action_tx, action)
+                        .instrument(info_span!("stdin_action_tx"))
+                        .await
+                        .unwrap(),
+                    ServerAction::Stdout(action) => send_source_action(&stdout_action_tx, action)
+                        .instrument(info_span!("stdout_action_tx"))
+                        .await
+                        .unwrap(),
+                    ServerAction::Stderr(action) => send_source_action(&stderr_action_tx, action)
+                        .instrument(info_span!("stderr_action_tx"))
+                        .await
+                        .unwrap(),
                     ServerAction::Exit(status) => {
                         exit_status_tx.take().unwrap().send(status).unwrap()
                     }
@@ -507,26 +526,47 @@ async fn handle_sink<T>(
 where
     T: Send + Sync + Debug + 'static,
 {
+    async fn do_if_not_closed(
+        is_closed: &mut bool,
+        act: impl Future<Output = io::Result<()>>,
+    ) -> Result<()> {
+        if *is_closed {
+            return Ok(());
+        }
+
+        match act.await {
+            Ok(()) => Ok(()),
+            Err(err) => match err.kind() {
+                io::ErrorKind::BrokenPipe => {
+                    *is_closed = true;
+                    Ok(())
+                }
+                _ => Err(err.into()),
+            },
+        }
+    }
+
     debug!("started");
+    let mut is_closed = false;
     while let Some(message) = action_rx.recv().await {
         match message {
             SourceAction::Data(bytes) => {
-                use std::io::ErrorKind;
-                trace!(len = bytes.len(), "received");
-                let msg = match writer.write_all(&bytes).await {
-                    Ok(()) => SinkAction::Ack,
-                    Err(e) => match e.kind() {
-                        ErrorKind::BrokenPipe => {
-                            debug!("pipe closed");
-                            SinkAction::SinkClosed
-                        }
-                        _ => bail!(e),
-                    },
-                };
-                msg_tx.send(from_action(msg)).await?;
+                trace!(len = bytes.len(), is_closed, "received");
+                do_if_not_closed(&mut is_closed, writer.write_all(&bytes)).await?;
+                if !is_closed {
+                    msg_tx.send(from_action(SinkAction::Ack)).await?;
+                }
+                do_if_not_closed(&mut is_closed, writer.flush()).await?;
             }
             SourceAction::SourceClosed => break,
         }
+        if is_closed {
+            // send SinkClosed each time when receiving any messages from source if sink has been closed
+            msg_tx.send(from_action(SinkAction::SinkClosed)).await?;
+        }
+    }
+    if let Err(err) = writer.shutdown().await {
+        debug!(?err, "failed to shutdown");
     }
     debug!("finished");
     Ok(())
@@ -635,4 +675,20 @@ enum SourceAction {
 enum SinkAction {
     Ack,
     SinkClosed,
+}
+
+async fn send_source_action(tx: &Sender<SourceAction>, action: SourceAction) -> Result<()> {
+    tx.send(action).await?;
+    Ok(())
+}
+
+async fn send_sink_action(tx: &Sender<SinkAction>, action: SinkAction) -> Result<()> {
+    if let Err(err) = tx.send(action).await {
+        // SinkClosed may be sent after the source closed, so ignore it.
+        debug!(?err);
+        if !matches!(err.0, SinkAction::SinkClosed) {
+            bail!(err)
+        }
+    }
+    Ok(())
 }
