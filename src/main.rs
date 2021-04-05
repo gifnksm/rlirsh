@@ -93,8 +93,8 @@ async fn main() -> Result<()> {
 
     let args = argh::from_env::<Args>();
     match args.command {
-        SubCommand::Server(server_args) => server_main(server_args).await.unwrap(),
-        SubCommand::Execute(client_args) => execute_main(client_args).await.unwrap(),
+        SubCommand::Server(server_args) => server_main(server_args).await?,
+        SubCommand::Execute(client_args) => execute_main(client_args).await?,
     }
 
     Ok(())
@@ -208,29 +208,35 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
             let mut reader = reader;
             debug!("started");
             loop {
-                let message = recv_message(&mut reader).await.unwrap();
+                let message = recv_message(&mut reader).await?;
                 trace!(?message);
                 match message {
-                    ClientAction::Stdin(action) => send_source_action(&stdin_action_tx, action)
-                        .instrument(info_span!("stdin_action_tx"))
-                        .await
-                        .unwrap(),
-                    ClientAction::Stdout(action) => send_sink_action(&stdout_action_tx, action)
-                        .instrument(info_span!("stdout_action_tx"))
-                        .await
-                        .unwrap(),
-                    ClientAction::Stderr(action) => send_sink_action(&stderr_action_tx, action)
-                        .instrument(info_span!("stderr_action_tx"))
-                        .await
-                        .unwrap(),
+                    ClientAction::Stdin(action) => {
+                        send_source_action(&stdin_action_tx, action)
+                            .instrument(info_span!("stdin_action_tx"))
+                            .await?
+                    }
+                    ClientAction::Stdout(action) => {
+                        send_sink_action(&stdout_action_tx, action)
+                            .instrument(info_span!("stdout_action_tx"))
+                            .await?
+                    }
+                    ClientAction::Stderr(action) => {
+                        send_sink_action(&stderr_action_tx, action)
+                            .instrument(info_span!("stderr_action_tx"))
+                            .await?
+                    }
                     ClientAction::Finished => break,
                 }
             }
             finish_notify2.notify_one();
             debug!("finished");
+            Ok::<(), Error>(())
         }
         .instrument(info_span!("receiver")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let sender = tokio::spawn(
         async move {
@@ -240,56 +246,51 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
                 trace!(?message);
                 send_message(&mut writer, &message)
                     .await
-                    .wrap_err("failed to send message")
-                    .unwrap();
+                    .wrap_err("failed to send message")?;
             }
             debug!("waiting for finished");
             finish_notify.notified().await;
             send_message(&mut writer, &ServerAction::Finished)
                 .await
-                .wrap_err("failed to send message")
-                .unwrap();
+                .wrap_err("failed to send message")?;
             debug!("finished");
+            Ok::<(), Error>(())
         }
         .instrument(info_span!("sender")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stdin_handler = tokio::spawn(
-        async move {
-            handle_sink(stdin, stdin_msg_tx, stdin_action_rx, ServerAction::Stdin)
-                .await
-                .unwrap();
-        }
-        .instrument(info_span!("stdin")),
-    );
+        handle_sink(stdin, stdin_msg_tx, stdin_action_rx, ServerAction::Stdin)
+            .instrument(info_span!("stdin")),
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stdout_handler = tokio::spawn(
-        async move {
-            handle_source(
-                stdout,
-                stdout_msg_tx,
-                stdout_action_rx,
-                ServerAction::Stdout,
-            )
-            .await
-            .unwrap();
-        }
+        handle_source(
+            stdout,
+            stdout_msg_tx,
+            stdout_action_rx,
+            ServerAction::Stdout,
+        )
         .instrument(info_span!("stdout")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stderr_handler = tokio::spawn(
-        async move {
-            handle_source(
-                stderr,
-                stderr_msg_tx,
-                stderr_action_rx,
-                ServerAction::Stderr,
-            )
-            .await
-            .unwrap();
-        }
+        handle_source(
+            stderr,
+            stderr_msg_tx,
+            stderr_action_rx,
+            ServerAction::Stderr,
+        )
         .instrument(info_span!("stderr")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let status = child.wait().await?;
     let status = if let Some(code) = status.code() {
@@ -322,7 +323,7 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
 }
 
 async fn execute_main(args: ExecuteArgs) -> Result<()> {
-    let stdin = Stdin::new()?;
+    let stdin = Stdin::new().wrap_err("failed to open stdin")?;
     let stdout = File::create("/dev/stdout")
         .await
         .wrap_err("failed to open stdout")?;
@@ -375,31 +376,39 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
             let mut exit_status_tx = Some(exit_status_tx);
             debug!("started");
             loop {
-                let message = recv_message(&mut reader).await.unwrap();
+                let message = recv_message(&mut reader).await?;
                 trace!(?message);
                 match message {
-                    ServerAction::Stdin(action) => send_sink_action(&stdin_action_tx, action)
-                        .instrument(info_span!("stdin_action_tx"))
-                        .await
-                        .unwrap(),
-                    ServerAction::Stdout(action) => send_source_action(&stdout_action_tx, action)
-                        .instrument(info_span!("stdout_action_tx"))
-                        .await
-                        .unwrap(),
-                    ServerAction::Stderr(action) => send_source_action(&stderr_action_tx, action)
-                        .instrument(info_span!("stderr_action_tx"))
-                        .await
-                        .unwrap(),
-                    ServerAction::Exit(status) => {
-                        exit_status_tx.take().unwrap().send(status).unwrap()
+                    ServerAction::Stdin(action) => {
+                        send_sink_action(&stdin_action_tx, action)
+                            .instrument(info_span!("stdin_action_tx"))
+                            .await?
                     }
+                    ServerAction::Stdout(action) => {
+                        send_source_action(&stdout_action_tx, action)
+                            .instrument(info_span!("stdout_action_tx"))
+                            .await?
+                    }
+                    ServerAction::Stderr(action) => {
+                        send_source_action(&stderr_action_tx, action)
+                            .instrument(info_span!("stderr_action_tx"))
+                            .await?
+                    }
+                    ServerAction::Exit(status) => exit_status_tx
+                        .take()
+                        .unwrap()
+                        .send(status)
+                        .map_err(|e| eyre!("failed to send exit status: {:?}", e))?,
                     ServerAction::Finished => break,
                 }
             }
             debug!("finished");
+            Ok::<(), Error>(())
         }
         .instrument(info_span!("receiver")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let sender = tokio::spawn(
         async move {
@@ -409,50 +418,46 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
                 trace!(?message);
                 send_message(&mut writer, &message)
                     .await
-                    .wrap_err("failed to send message")
-                    .unwrap();
+                    .wrap_err("failed to send message")?;
             }
             debug!("finished");
+            Ok::<(), Error>(())
         }
         .instrument(info_span!("sender")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stdin_handler = tokio::spawn(
-        async move {
-            handle_source(stdin, stdin_msg_tx, stdin_action_rx, ClientAction::Stdin)
-                .await
-                .unwrap()
-        }
-        .instrument(info_span!("stdin")),
-    );
+        handle_source(stdin, stdin_msg_tx, stdin_action_rx, ClientAction::Stdin)
+            .instrument(info_span!("stdin")),
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stdout_handler = tokio::spawn(
-        async move {
-            handle_sink(
-                stdout,
-                stdout_msg_tx,
-                stdout_action_rx,
-                ClientAction::Stdout,
-            )
-            .await
-            .unwrap();
-        }
+        handle_sink(
+            stdout,
+            stdout_msg_tx,
+            stdout_action_rx,
+            ClientAction::Stdout,
+        )
         .instrument(info_span!("stdout")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let stderr_handler = tokio::spawn(
-        async move {
-            handle_sink(
-                stderr,
-                stderr_msg_tx,
-                stderr_action_rx,
-                ClientAction::Stderr,
-            )
-            .await
-            .unwrap();
-        }
+        handle_sink(
+            stderr,
+            stderr_msg_tx,
+            stderr_action_rx,
+            ClientAction::Stderr,
+        )
         .instrument(info_span!("stderr")),
-    );
+    )
+    .err_into()
+    .and_then(future::ready);
 
     let status = exit_status_rx.await?;
     debug!(?status, "exit");
