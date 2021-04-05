@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::{prelude::*, stdin::Stdin};
 use argh::FromArgs;
 use etc_passwd::Passwd;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ use tokio::{
 };
 
 mod prelude;
+mod stdin;
 
 /// Rootless insecure remote shell
 #[derive(Debug, FromArgs)]
@@ -84,26 +85,16 @@ fn init_tracing() {
         .init();
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
 
     let args = argh::from_env::<Args>();
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    runtime.block_on(async {
-        match args.command {
-            SubCommand::Server(server_args) => server_main(server_args).await.unwrap(),
-            SubCommand::Execute(client_args) => execute_main(client_args).await.unwrap(),
-        }
-    });
-
-    // Workaround for problems that do not terminate the program.
-    // Reading standard input may be blocking the termination of the program.
-    runtime.shutdown_background();
+    match args.command {
+        SubCommand::Server(server_args) => server_main(server_args).await.unwrap(),
+        SubCommand::Execute(client_args) => execute_main(client_args).await.unwrap(),
+    }
 
     Ok(())
 }
@@ -321,9 +312,7 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
 }
 
 async fn execute_main(args: ExecuteArgs) -> Result<()> {
-    let stdin = File::open("/dev/stdin")
-        .await
-        .wrap_err("failed to open stdin")?;
+    let stdin = Stdin::new()?;
     let stdout = File::create("/dev/stdout")
         .await
         .wrap_err("failed to open stdout")?;

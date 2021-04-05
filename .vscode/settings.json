@@ -3,6 +3,8 @@
         "addrs",
         "argh",
         "bincode",
+        "libc",
+        "nonblock",
         "oneshot",
         "reuseaddr",
         "rlirsh",
