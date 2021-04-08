@@ -2,15 +2,28 @@ use crate::{
     prelude::*,
     protocol::{SinkAction, SourceAction, MAX_STREAM_PACKET_SIZE},
 };
+use std::fmt::Debug;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::mpsc,
 };
 use tracing::Span;
 
-pub(crate) fn new<R>(reader: R, tx: mpsc::Sender<SourceAction>) -> (Sender, Source<R>) {
+pub(crate) fn new<R, T, F>(
+    reader: R,
+    tx: mpsc::Sender<T>,
+    from_action: F,
+) -> (Sender, Source<R, T, F>) {
     let (sink_tx, rx) = mpsc::channel(1);
-    (Sender(sink_tx), Source { reader, tx, rx })
+    (
+        Sender(sink_tx),
+        Source {
+            reader,
+            tx,
+            rx,
+            from_action,
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -30,15 +43,18 @@ impl Sender {
 }
 
 #[derive(Debug)]
-pub(crate) struct Source<R> {
+pub(crate) struct Source<R, T, F> {
     reader: R,
-    tx: mpsc::Sender<SourceAction>,
+    tx: mpsc::Sender<T>,
     rx: mpsc::Receiver<SinkAction>,
+    from_action: F,
 }
 
-impl<R> Source<R>
+impl<R, T, F> Source<R, T, F>
 where
     R: AsyncRead + Send + 'static,
+    T: Debug + Send + Sync + 'static,
+    F: Fn(SourceAction) -> T + Send + Sync + 'static,
 {
     pub(crate) fn spawn(self, span: Span) -> impl Future<Output = Result<()>> {
         tokio::spawn(self.handle().instrument(span))
@@ -47,7 +63,12 @@ where
     }
 
     async fn handle(self) -> Result<()> {
-        let Self { reader, tx, mut rx } = self;
+        let Self {
+            reader,
+            tx,
+            mut rx,
+            from_action,
+        } = self;
         tokio::pin!(reader);
 
         let mut buf = vec![0; MAX_STREAM_PACKET_SIZE];
@@ -63,7 +84,7 @@ where
 
                     let message = SourceAction::Data(buf[..size].into());
                     tx
-                        .send(message)
+                        .send(from_action(message))
                         .await
                         .wrap_err("failed to send message")?;
                     let message = rx.recv().await.unwrap();
@@ -83,7 +104,7 @@ where
                 }
             };
         }
-        tx.send(SourceAction::SourceClosed)
+        tx.send(from_action(SourceAction::SourceClosed))
             .await
             .wrap_err("failed to send message")?;
         trace!("finished");
