@@ -86,6 +86,8 @@ pub(crate) enum SinkAction {
     SinkClosed,
 }
 
+pub(crate) const MAX_STREAM_PACKET_SIZE: usize = 4096;
+
 const MESSAGE_SIZE_LIMIT: u32 = 1024 * 1024; // 1MiB
 
 pub(crate) async fn recv_message<T>(stream: &mut (impl AsyncRead + Unpin)) -> Result<T>
