@@ -185,11 +185,11 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
 
     let (reader, writer) = stream.into_split();
 
-    let (msg_tx, mut msg_rx) = mpsc::channel::<ServerAction>(128);
-    let stdin_msg_tx = msg_tx.clone();
-    let stdout_msg_tx = msg_tx.clone();
-    let stderr_msg_tx = msg_tx.clone();
-    let exit_msg_tx = msg_tx;
+    let (stdin_msg_tx, mut stdin_msg_rx) = mpsc::channel::<SinkAction>(1);
+    let stdin_msg_tx2 = stdin_msg_tx.clone();
+    let (stdout_msg_tx, mut stdout_msg_rx) = mpsc::channel::<SourceAction>(1);
+    let (stderr_msg_tx, mut stderr_msg_rx) = mpsc::channel::<SourceAction>(1);
+    let (exit_msg_tx, mut exit_msg_rx) = mpsc::channel::<ExitStatus>(1);
 
     let (stdin_action_tx, stdin_action_rx) = mpsc::channel::<SourceAction>(1);
     let (stdout_action_tx, stdout_action_rx) = mpsc::channel::<SinkAction>(1);
@@ -241,7 +241,14 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
         async move {
             let mut writer = writer;
             debug!("started");
-            while let Some(message) = msg_rx.recv().await {
+            loop {
+                let message = tokio::select! {
+                    Some(message) = stdin_msg_rx.recv() => ServerAction::Stdin(message),
+                    Some(message) = stdout_msg_rx.recv() => ServerAction::Stdout(message),
+                    Some(message) = stderr_msg_rx.recv() => ServerAction::Stderr(message),
+                    Some(message) = exit_msg_rx.recv() => ServerAction::Exit(message),
+                    else => break
+                };
                 trace!(?message);
                 send_message(&mut writer, &message)
                     .await
@@ -261,32 +268,19 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     .and_then(future::ready);
 
     let stdin_handler = tokio::spawn(
-        handle_sink(stdin, stdin_msg_tx, stdin_action_rx, ServerAction::Stdin)
-            .instrument(info_span!("stdin")),
+        handle_sink(stdin, stdin_msg_tx, stdin_action_rx).instrument(info_span!("stdin")),
     )
     .err_into()
     .and_then(future::ready);
 
     let stdout_handler = tokio::spawn(
-        handle_source(
-            stdout,
-            stdout_msg_tx,
-            stdout_action_rx,
-            ServerAction::Stdout,
-        )
-        .instrument(info_span!("stdout")),
+        handle_source(stdout, stdout_msg_tx, stdout_action_rx).instrument(info_span!("stdout")),
     )
     .err_into()
     .and_then(future::ready);
 
     let stderr_handler = tokio::spawn(
-        handle_source(
-            stderr,
-            stderr_msg_tx,
-            stderr_action_rx,
-            ServerAction::Stderr,
-        )
-        .instrument(info_span!("stderr")),
+        handle_source(stderr, stderr_msg_tx, stderr_action_rx).instrument(info_span!("stderr")),
     )
     .err_into()
     .and_then(future::ready);
@@ -302,10 +296,9 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     // Notifies the client that the standard input pipe connected to the child process is closed.
     // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
     // does not support such an operation, so send a message to the client to alternate it.
-    exit_msg_tx
-        .send(ServerAction::Stdin(SinkAction::SinkClosed))
-        .await?;
-    exit_msg_tx.send(ServerAction::Exit(status)).await?;
+    stdin_msg_tx2.send(SinkAction::SinkClosed).await?;
+    drop(stdin_msg_tx2);
+    exit_msg_tx.send(status).await?;
     drop(exit_msg_tx);
 
     tokio::try_join!(
@@ -357,11 +350,10 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
 
     let (reader, writer) = stream.into_split();
 
-    let (msg_tx, mut msg_rx) = mpsc::channel::<ClientAction>(128);
-    let stdin_msg_tx = msg_tx.clone();
-    let stdout_msg_tx = msg_tx.clone();
-    let stderr_msg_tx = msg_tx.clone();
-    let finish_msg_tx = msg_tx;
+    let (stdin_msg_tx, mut stdin_msg_rx) = mpsc::channel::<SourceAction>(1);
+    let (stdout_msg_tx, mut stdout_msg_rx) = mpsc::channel::<SinkAction>(1);
+    let (stderr_msg_tx, mut stderr_msg_rx) = mpsc::channel::<SinkAction>(1);
+    let (finish_msg_tx, mut finish_msg_rx) = mpsc::channel::<()>(1);
 
     let (stdin_action_tx, stdin_action_rx) = mpsc::channel::<SinkAction>(1);
     let (stdout_action_tx, stdout_action_rx) = mpsc::channel::<SourceAction>(1);
@@ -413,7 +405,14 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
         async move {
             let mut writer = writer;
             debug!("started");
-            while let Some(message) = msg_rx.recv().await {
+            loop {
+                let message = tokio::select! {
+                    Some(message) = stdin_msg_rx.recv() => ClientAction::Stdin(message),
+                    Some(message) = stdout_msg_rx.recv() => ClientAction::Stdout(message),
+                    Some(message) = stderr_msg_rx.recv() => ClientAction::Stderr(message),
+                    Some(()) = finish_msg_rx.recv() =>  ClientAction::Finished,
+                    else => break,
+                };
                 trace!(?message);
                 send_message(&mut writer, &message)
                     .await
@@ -428,32 +427,19 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
     .and_then(future::ready);
 
     let stdin_handler = tokio::spawn(
-        handle_source(stdin, stdin_msg_tx, stdin_action_rx, ClientAction::Stdin)
-            .instrument(info_span!("stdin")),
+        handle_source(stdin, stdin_msg_tx, stdin_action_rx).instrument(info_span!("stdin")),
     )
     .err_into()
     .and_then(future::ready);
 
     let stdout_handler = tokio::spawn(
-        handle_sink(
-            stdout,
-            stdout_msg_tx,
-            stdout_action_rx,
-            ClientAction::Stdout,
-        )
-        .instrument(info_span!("stdout")),
+        handle_sink(stdout, stdout_msg_tx, stdout_action_rx).instrument(info_span!("stdout")),
     )
     .err_into()
     .and_then(future::ready);
 
     let stderr_handler = tokio::spawn(
-        handle_sink(
-            stderr,
-            stderr_msg_tx,
-            stderr_action_rx,
-            ClientAction::Stderr,
-        )
-        .instrument(info_span!("stderr")),
+        handle_sink(stderr, stderr_msg_tx, stderr_action_rx).instrument(info_span!("stderr")),
     )
     .err_into()
     .and_then(future::ready);
@@ -462,7 +448,7 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
     debug!(?status, "exit");
     tokio::try_join!(stdin_handler, stdout_handler, stderr_handler)?;
     debug!("handle completed");
-    finish_msg_tx.send(ClientAction::Finished).await?;
+    finish_msg_tx.send(()).await?;
     drop(finish_msg_tx);
 
     tokio::try_join!(receiver, sender)?;
@@ -474,15 +460,11 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
 
 const BUFFER_SIZE: usize = 4096;
 
-async fn handle_sink<T>(
+async fn handle_sink(
     mut writer: impl AsyncWrite + Unpin,
-    msg_tx: Sender<T>,
+    msg_tx: Sender<SinkAction>,
     mut action_rx: Receiver<SourceAction>,
-    from_action: impl Fn(SinkAction) -> T,
-) -> Result<()>
-where
-    T: Send + Sync + Debug + 'static,
-{
+) -> Result<()> {
     async fn do_if_not_closed(
         is_closed: &mut bool,
         act: impl Future<Output = io::Result<()>>,
@@ -511,7 +493,7 @@ where
                 trace!(len = bytes.len(), is_closed, "received");
                 do_if_not_closed(&mut is_closed, writer.write_all(&bytes)).await?;
                 if !is_closed {
-                    msg_tx.send(from_action(SinkAction::Ack)).await?;
+                    msg_tx.send(SinkAction::Ack).await?;
                 }
                 do_if_not_closed(&mut is_closed, writer.flush()).await?;
             }
@@ -519,7 +501,7 @@ where
         }
         if is_closed {
             // send SinkClosed each time when receiving any messages from source if sink has been closed
-            msg_tx.send(from_action(SinkAction::SinkClosed)).await?;
+            msg_tx.send(SinkAction::SinkClosed).await?;
         }
     }
     if let Err(err) = writer.shutdown().await {
@@ -529,15 +511,11 @@ where
     Ok(())
 }
 
-async fn handle_source<T>(
+async fn handle_source(
     mut reader: impl AsyncRead + Unpin,
-    msg_tx: Sender<T>,
+    msg_tx: Sender<SourceAction>,
     mut action_rx: Receiver<SinkAction>,
-    from_action: impl Fn(SourceAction) -> T,
-) -> Result<()>
-where
-    T: Send + Sync + Debug + 'static,
-{
+) -> Result<()> {
     let mut buf = vec![0; BUFFER_SIZE];
     debug!("started");
     loop {
@@ -549,7 +527,7 @@ where
                 }
                 trace!(%size, "bytes read");
 
-                let message = from_action(SourceAction::Data(buf[..size].into()));
+                let message = SourceAction::Data(buf[..size].into());
                 msg_tx
                     .send(message)
                     .await
@@ -572,7 +550,7 @@ where
         };
     }
     msg_tx
-        .send(from_action(SourceAction::SourceClosed))
+        .send(SourceAction::SourceClosed)
         .await
         .wrap_err("failed to send message")?;
     debug!("finished");
