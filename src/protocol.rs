@@ -1,0 +1,138 @@
+use crate::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::{convert::TryFrom, fmt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum Request {
+    Execute(ExecuteRequest),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ExecuteRequest {
+    pub(crate) cmd: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) envs: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ExecuteResponse {
+    Ok,
+    Err(String),
+}
+
+#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
+pub(crate) enum ExitStatus {
+    Code(i32),
+    Signal(i32),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ServerAction {
+    Stdin(SinkAction),
+    Stdout(SourceAction),
+    Stderr(SourceAction),
+    Exit(ExitStatus),
+    Finished,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ClientAction {
+    Stdin(SourceAction),
+    Stdout(SinkAction),
+    Stderr(SinkAction),
+    Finished,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) enum SourceAction {
+    Data(Vec<u8>),
+    SourceClosed,
+}
+
+impl fmt::Debug for SourceAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Bytes<'a>(&'a [u8]);
+        impl fmt::Debug for Bytes<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                const LENGTH: usize = 8;
+                for (idx, byte) in self.0.iter().take(LENGTH).enumerate() {
+                    if idx != 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{:02x}", byte)?;
+                }
+                if self.0.len() > LENGTH {
+                    write!(f, " ..")?;
+                }
+                Ok(())
+            }
+        }
+
+        match self {
+            SourceAction::Data(bytes) => f
+                .debug_struct("Data")
+                .field("len", &bytes.len())
+                .field("bytes", &Bytes(&bytes))
+                .finish(),
+            SourceAction::SourceClosed => f.debug_tuple("SourceClosed").finish(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum SinkAction {
+    Ack,
+    SinkClosed,
+}
+
+const MESSAGE_SIZE_LIMIT: u32 = 1024 * 1024; // 1MiB
+
+pub(crate) async fn recv_message<T>(stream: &mut (impl AsyncRead + Unpin)) -> Result<T>
+where
+    T: for<'a> Deserialize<'a> + 'static,
+{
+    let size = stream
+        .read_u32()
+        .await
+        .wrap_err("failed to receive message size")?;
+    ensure!(
+        size <= MESSAGE_SIZE_LIMIT,
+        "message size is too large, size={}",
+        size
+    );
+    // TODO: reuse buffer
+    let mut bytes = vec![0; size as usize];
+    stream
+        .read_exact(&mut bytes)
+        .await
+        .wrap_err("failed to receive message")?;
+    let data = bincode::deserialize(&bytes).wrap_err("failed to deserialize message")?;
+    Ok(data)
+}
+
+pub(crate) async fn send_message<T>(stream: &mut (impl AsyncWrite + Unpin), data: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let size = bincode::serialized_size(&data)?;
+    ensure!(
+        size <= u64::from(MESSAGE_SIZE_LIMIT),
+        "serialized size is too large, size={}",
+        size
+    );
+
+    let size = u32::try_from(size).unwrap();
+    stream
+        .write_u32(size)
+        .await
+        .wrap_err("failed to send message size")?;
+
+    // TODO: use reusable buffer
+    let bytes = bincode::serialize(data).wrap_err("failed to serialize message")?;
+    stream
+        .write_all(&bytes)
+        .await
+        .wrap_err("failed to write message")?;
+    Ok(())
+}

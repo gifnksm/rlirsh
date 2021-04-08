@@ -1,12 +1,10 @@
-use crate::{prelude::*, stdin::Stdin};
+use crate::{prelude::*, protocol::*, stdin::Stdin};
 use argh::FromArgs;
 use etc_passwd::Passwd;
-use serde::{Deserialize, Serialize};
 use std::{
-    convert::TryFrom,
     env,
     ffi::OsString,
-    fmt::{self, Debug},
+    fmt::Debug,
     future::Future,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     os::unix::prelude::ExitStatusExt,
@@ -25,6 +23,7 @@ use tokio::{
 };
 
 mod prelude;
+mod protocol;
 mod stdin;
 
 /// Rootless insecure remote shell
@@ -473,54 +472,7 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
     Ok(())
 }
 
-const MESSAGE_SIZE_LIMIT: u32 = 1024 * 1024; // 1MiB
-
-async fn recv_message<T>(stream: &mut (impl AsyncRead + Unpin)) -> Result<T>
-where
-    T: for<'a> Deserialize<'a> + 'static,
-{
-    let size = stream
-        .read_u32()
-        .await
-        .wrap_err("failed to receive message size")?;
-    ensure!(
-        size <= MESSAGE_SIZE_LIMIT,
-        "message size is too large, size={}",
-        size
-    );
-    let mut bytes = vec![0; size as usize];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .wrap_err("failed to receive message")?;
-    let data = bincode::deserialize(&bytes).wrap_err("failed to deserialize message")?;
-    Ok(data)
-}
-
-async fn send_message<T>(stream: &mut (impl AsyncWrite + Unpin), data: &T) -> Result<()>
-where
-    T: Serialize,
-{
-    let size = bincode::serialized_size(&data)?;
-    ensure!(
-        size <= u64::from(MESSAGE_SIZE_LIMIT),
-        "serialized size is too large, size={}",
-        size
-    );
-
-    let size = u32::try_from(size).unwrap();
-    stream
-        .write_u32(size)
-        .await
-        .wrap_err("failed to send message size")?;
-
-    let bytes = bincode::serialize(data).wrap_err("failed to serialize message")?;
-    stream
-        .write_all(&bytes)
-        .await
-        .wrap_err("failed to write message")?;
-    Ok(())
-}
+const BUFFER_SIZE: usize = 4096;
 
 async fn handle_sink<T>(
     mut writer: impl AsyncWrite + Unpin,
@@ -625,91 +577,6 @@ where
         .wrap_err("failed to send message")?;
     debug!("finished");
     Ok(())
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum Request {
-    Execute(ExecuteRequest),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ExecuteRequest {
-    cmd: String,
-    args: Vec<String>,
-    envs: Vec<(String, String)>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum ExecuteResponse {
-    Ok,
-    Err(String),
-}
-
-const BUFFER_SIZE: usize = 4096;
-
-#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
-enum ExitStatus {
-    Code(i32),
-    Signal(i32),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum ServerAction {
-    Stdin(SinkAction),
-    Stdout(SourceAction),
-    Stderr(SourceAction),
-    Exit(ExitStatus),
-    Finished,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum ClientAction {
-    Stdin(SourceAction),
-    Stdout(SinkAction),
-    Stderr(SinkAction),
-    Finished,
-}
-
-#[derive(Deserialize, Serialize)]
-enum SourceAction {
-    Data(Vec<u8>),
-    SourceClosed,
-}
-
-impl Debug for SourceAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        struct Bytes<'a>(&'a [u8]);
-        impl fmt::Debug for Bytes<'_> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                const LENGTH: usize = 8;
-                for (idx, byte) in self.0.iter().take(LENGTH).enumerate() {
-                    if idx != 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{:02x}", byte)?;
-                }
-                if self.0.len() > LENGTH {
-                    write!(f, " ..")?;
-                }
-                Ok(())
-            }
-        }
-
-        match self {
-            SourceAction::Data(bytes) => f
-                .debug_struct("Data")
-                .field("len", &bytes.len())
-                .field("bytes", &Bytes(&bytes))
-                .finish(),
-            SourceAction::SourceClosed => f.debug_tuple("SourceClosed").finish(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum SinkAction {
-    Ack,
-    SinkClosed,
 }
 
 async fn send_source_action(tx: &Sender<SourceAction>, action: SourceAction) -> Result<()> {
