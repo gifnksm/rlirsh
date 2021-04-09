@@ -402,7 +402,7 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
                     }
                     ServerAction::Exit(status) => exit_status_tx
                         .take()
-                        .unwrap()
+                        .ok_or_else(|| eyre!("received exit status multiple times"))?
                         .send(status)
                         .map_err(|e| eyre!("failed to send exit status: {:?}", e))?,
                     ServerAction::Finished => break,

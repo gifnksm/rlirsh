@@ -87,7 +87,7 @@ where
                         .send(from_action(message))
                         .await
                         .wrap_err("failed to send message")?;
-                    let message = rx.recv().await.unwrap();
+                    let message = rx.recv().await.ok_or_else(|| eyre!("failed to receive message"))?;
                     trace!(?message);
                     match message {
                         SinkAction::Ack => {}
@@ -95,7 +95,7 @@ where
                     }
                 }
                 message = rx.recv() => {
-                    let message = message.unwrap();
+                    let message = message.ok_or_else(|| eyre!("failed to receive message"))?;
                     trace!(?message);
                     match message {
                         SinkAction::Ack => panic!("invalid message received"),
