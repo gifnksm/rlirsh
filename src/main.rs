@@ -258,14 +258,16 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
             let mut writer = writer;
             let mut send_msg_rx = send_msg_rx;
             trace!("started");
+            // send messages to server until all stream closed
             while let Some(message) = send_msg_rx.recv().await {
                 trace!(?message);
                 send_message(&mut writer, &message)
                     .await
                     .wrap_err("failed to send message")?;
             }
-            trace!("waiting for finished");
+            // all stream closed, waiting for receiver task finished
             finish_notify.notified().await;
+            // receiver closed, notify to the client
             send_message(&mut writer, &ServerAction::Finished)
                 .await
                 .wrap_err("failed to send message")?;
@@ -299,7 +301,6 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     drop(send_msg_tx);
 
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
-
     info!("serve finished");
 
     Ok(())
@@ -374,6 +375,7 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
         handlers.push(task.spawn(info_span!("stderr")).boxed());
     }
     let (exit_status_tx, exit_status_rx) = oneshot::channel::<ExitStatus>();
+    drop(send_msg_tx);
 
     let receiver = tokio::spawn(
         async move {
@@ -427,6 +429,10 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
                     .await
                     .wrap_err("failed to send message")?;
             }
+            // all stream closed, notify to the server
+            send_message(&mut writer, &ClientAction::Finished)
+                .await
+                .wrap_err("failed to send message")?;
             trace!("finished");
             Ok::<(), Error>(())
         }
@@ -437,13 +443,8 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
 
     let status = exit_status_rx.await?;
     debug!(?status, "exit");
-    future::try_join_all(handlers).await?;
-    debug!("handle completed");
-    send_msg_tx.send(ClientAction::Finished).await?;
-    drop(send_msg_tx);
 
-    tokio::try_join!(receiver, sender)?;
-
+    tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
     debug!("finished");
 
     Ok(())
