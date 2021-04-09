@@ -2,6 +2,7 @@ use crate::{prelude::*, protocol::*, stdin::Stdin};
 use argh::FromArgs;
 use etc_passwd::Passwd;
 use std::{
+    collections::HashMap,
     env,
     ffi::OsString,
     fmt::Debug,
@@ -181,20 +182,40 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     info!(id = ?child.id(), "spawned");
 
     let (reader, writer) = stream.into_split();
-
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let finish_notify = Arc::new(Notify::new());
     let finish_notify2 = finish_notify.clone();
 
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let mut c2s_tx_map = HashMap::new();
+    let mut s2c_tx_map = HashMap::new();
+    let mut handlers = vec![];
 
-    let (stdin_action_tx, stdin_task) = sink::new(stdin, send_msg_tx.clone(), ServerAction::Stdin);
-    let (stdout_action_tx, stdout_task) =
-        source::new(stdout, send_msg_tx.clone(), ServerAction::Stdout);
-    let (stderr_action_tx, stderr_task) =
-        source::new(stderr, send_msg_tx.clone(), ServerAction::Stderr);
+    if let Some(stdin) = child.stdin.take() {
+        let kind = C2sStreamKind::Stdin;
+        let (tx, task) = sink::new(stdin, send_msg_tx.clone(), move |action| {
+            ServerAction::SinkAction(kind, action)
+        });
+        c2s_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stdin")).boxed());
+    }
+    if let Some(stdout) = child.stdout.take() {
+        let kind = S2cStreamKind::Stdout;
+        let (tx, task) = source::new(stdout, send_msg_tx.clone(), move |action| {
+            ServerAction::SourceAction(kind, action)
+        });
+        s2c_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stdout")).boxed());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let kind = S2cStreamKind::Stderr;
+        let (tx, task) = source::new(stderr, send_msg_tx.clone(), move |action| {
+            ServerAction::SourceAction(kind, action)
+        });
+        s2c_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stderr")).boxed());
+    }
+
+    let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
 
     let receiver = tokio::spawn(
         async move {
@@ -204,22 +225,20 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
                 let message = recv_message(&mut reader).await?;
                 trace!(?message);
                 match message {
-                    ClientAction::Stdin(action) => {
-                        stdin_action_tx
-                            .send(action)
-                            .instrument(info_span!("stdin_action_tx"))
+                    ClientAction::SourceAction(kind, action) => {
+                        let tx = c2s_tx_map
+                            .get(&kind)
+                            .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
+                        tx.send(action)
+                            .instrument(info_span!("source", ?kind))
                             .await?
                     }
-                    ClientAction::Stdout(action) => {
-                        stdout_action_tx
-                            .send(action)
-                            .instrument(info_span!("stdout_action_tx"))
-                            .await?
-                    }
-                    ClientAction::Stderr(action) => {
-                        stderr_action_tx
-                            .send(action)
-                            .instrument(info_span!("stderr_action_tx"))
+                    ClientAction::SinkAction(kind, action) => {
+                        let tx = s2c_tx_map
+                            .get(&kind)
+                            .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
+                        tx.send(action)
+                            .instrument(info_span!("sink", ?kind))
                             .await?
                     }
                     ClientAction::Finished => break,
@@ -258,10 +277,6 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     .err_into()
     .and_then(future::ready);
 
-    let stdin_handler = stdin_task.spawn(info_span!("stdin"));
-    let stdout_handler = stdout_task.spawn(info_span!("stdout"));
-    let stderr_handler = stderr_task.spawn(info_span!("stderr"));
-
     let status = child.wait().await?;
     let status = if let Some(code) = status.code() {
         ExitStatus::Code(code)
@@ -274,19 +289,16 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
     // Notifies the client that the standard input pipe connected to the child process is closed.
     // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
     // does not support such an operation, so send a message to the client to alternate it.
-    send_msg_tx
-        .send(ServerAction::Stdin(SinkAction::SinkClosed))
-        .await?;
+    for kind in c2s_kinds {
+        send_msg_tx
+            .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
+            .await
+            .wrap_err("failed to send message")?;
+    }
     send_msg_tx.send(ServerAction::Exit(status)).await?;
     drop(send_msg_tx);
 
-    tokio::try_join!(
-        receiver,
-        sender,
-        stdin_handler,
-        stdout_handler,
-        stderr_handler,
-    )?;
+    tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
 
     info!("serve finished");
 
@@ -294,14 +306,6 @@ async fn serve_execute(mut stream: TcpStream, req: ExecuteRequest) -> Result<()>
 }
 
 async fn execute_main(args: ExecuteArgs) -> Result<()> {
-    let stdin = Stdin::new().wrap_err("failed to open stdin")?;
-    let stdout = File::create("/dev/stdout")
-        .await
-        .wrap_err("failed to open stdout")?;
-    let stderr = File::create("/dev/stderr")
-        .await
-        .wrap_err("failed to open stderr")?;
-
     let socket = if args.host.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -327,14 +331,48 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
     }
     debug!("command started");
 
+    let send_stdin = true;
+    let send_stdout = true;
+    let send_stderr = true;
+
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
-    let (stdin_action_tx, stdin_task) =
-        source::new(stdin, send_msg_tx.clone(), ClientAction::Stdin);
-    let (stdout_action_tx, stdout_task) =
-        sink::new(stdout, send_msg_tx.clone(), ClientAction::Stdout);
-    let (stderr_action_tx, stderr_task) =
-        sink::new(stderr, send_msg_tx.clone(), ClientAction::Stderr);
+
+    let mut c2s_tx_map = HashMap::new();
+    let mut s2c_tx_map = HashMap::new();
+    let mut handlers = vec![];
+
+    if send_stdin {
+        let kind = C2sStreamKind::Stdin;
+        let stdin = Stdin::new().wrap_err("failed to open stdin")?;
+        let (tx, task) = source::new(stdin, send_msg_tx.clone(), move |action| {
+            ClientAction::SourceAction(kind, action)
+        });
+        c2s_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stdin")).boxed());
+    }
+    if send_stdout {
+        let kind = S2cStreamKind::Stdout;
+        let stdout = File::create("/dev/stdout")
+            .await
+            .wrap_err("failed to open stdout")?;
+        let (tx, task) = sink::new(stdout, send_msg_tx.clone(), move |action| {
+            ClientAction::SinkAction(kind, action)
+        });
+        s2c_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stdout")).boxed());
+    }
+    if send_stderr {
+        let kind = S2cStreamKind::Stderr;
+        let stderr = File::create("/dev/stderr")
+            .await
+            .wrap_err("failed to open stderr")?;
+        let (tx, task) = sink::new(stderr, send_msg_tx.clone(), move |action| {
+            ClientAction::SinkAction(kind, action)
+        });
+        s2c_tx_map.insert(kind, tx);
+        handlers.push(task.spawn(info_span!("stderr")).boxed());
+    }
     let (exit_status_tx, exit_status_rx) = oneshot::channel::<ExitStatus>();
 
     let receiver = tokio::spawn(
@@ -346,22 +384,20 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
                 let message = recv_message(&mut reader).await?;
                 trace!(?message);
                 match message {
-                    ServerAction::Stdin(action) => {
-                        stdin_action_tx
-                            .send(action)
-                            .instrument(info_span!("stdin_action_tx"))
+                    ServerAction::SourceAction(kind, action) => {
+                        let tx = s2c_tx_map
+                            .get(&kind)
+                            .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
+                        tx.send(action)
+                            .instrument(info_span!("source", ?kind))
                             .await?
                     }
-                    ServerAction::Stdout(action) => {
-                        stdout_action_tx
-                            .send(action)
-                            .instrument(info_span!("stdout_action_tx"))
-                            .await?
-                    }
-                    ServerAction::Stderr(action) => {
-                        stderr_action_tx
-                            .send(action)
-                            .instrument(info_span!("stderr_action_tx"))
+                    ServerAction::SinkAction(kind, action) => {
+                        let tx = c2s_tx_map
+                            .get(&kind)
+                            .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
+                        tx.send(action)
+                            .instrument(info_span!("sink", ?kind))
                             .await?
                     }
                     ServerAction::Exit(status) => exit_status_tx
@@ -399,13 +435,9 @@ async fn execute_main(args: ExecuteArgs) -> Result<()> {
     .err_into()
     .and_then(future::ready);
 
-    let stdin_handler = stdin_task.spawn(info_span!("stdin"));
-    let stdout_handler = stdout_task.spawn(info_span!("stdout"));
-    let stderr_handler = stderr_task.spawn(info_span!("stderr"));
-
     let status = exit_status_rx.await?;
     debug!(?status, "exit");
-    tokio::try_join!(stdin_handler, stdout_handler, stderr_handler)?;
+    future::try_join_all(handlers).await?;
     debug!("handle completed");
     send_msg_tx.send(ClientAction::Finished).await?;
     drop(send_msg_tx);

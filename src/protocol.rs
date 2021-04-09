@@ -27,20 +27,29 @@ pub(crate) enum ExitStatus {
     Signal(i32),
 }
 
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum C2sStreamKind {
+    Stdin,
+}
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum S2cStreamKind {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum ServerAction {
-    Stdin(SinkAction),
-    Stdout(SourceAction),
-    Stderr(SourceAction),
+    SourceAction(S2cStreamKind, SourceAction),
+    SinkAction(C2sStreamKind, SinkAction),
     Exit(ExitStatus),
     Finished,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum ClientAction {
-    Stdin(SourceAction),
-    Stdout(SinkAction),
-    Stderr(SinkAction),
+    SourceAction(C2sStreamKind, SourceAction),
+    SinkAction(S2cStreamKind, SinkAction),
     Finished,
 }
 
