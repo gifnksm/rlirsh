@@ -145,5 +145,9 @@ where
         .write_all(&bytes)
         .await
         .wrap_err("failed to write message")?;
+
+    // TCP stream's flush is a no-op, but flush here for consistency
+    stream.flush().await.wrap_err("failed to flush stream")?;
+
     Ok(())
 }
