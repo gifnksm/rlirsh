@@ -9,5 +9,8 @@
         "reuseaddr",
         "rlirsh",
         "subcommand"
-    ]
+    ],
+    "plantuml.diagramsRoot": "design/src",
+    "plantuml.exportFormat": "svg",
+    "plantuml.exportOutDir": "design"
 }

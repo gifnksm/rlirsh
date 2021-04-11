@@ -1,0 +1,69 @@
+@startuml stream_sequence
+
+queue       "Pipe (in)"  as pipe_in
+participant Source       as source
+participant Sink         as sink
+queue       "Pipe (out)" as pipe_out
+
+activate source
+activate sink
+loop Pipe (in/out) not closed
+    |||
+    source -> pipe_in ++ : read()
+    sink -> sink ++ : recv()
+    pipe_in --> source -- : non-empty data
+    source ->> sink : send(SourecAction::Data)
+    source -> source ++ : recv()
+
+    sink --> sink -- : SourceAction::Data
+    sink -> pipe_out ++ : write_all()
+    return Ok(())
+    sink ->> source : send(SinkAction::Ack)
+    sink -> pipe_out ++ : flush()
+    return Ok(())
+    source --> source -- : SinkAction::Ack
+    |||
+end
+
+alt Pipe (in) closed
+    |||
+    source -> pipe_in ++ : read()
+    sink -> sink ++ : recv()
+    pipe_in --> source -- : empty data\n(pipe closed)
+    source ->> sink : send(SourceAction::SourceClosed)
+
+    sink --> sink -- : SourceAction::SourceClosed
+    sink -> pipe_out ++ : shutdown()
+    return Ok(())
+    |||
+else Read after Pipe (out) closed
+    |||
+    source -> pipe_in ++ : read()
+    sink -> sink ++ : recv()
+    pipe_in --> source -- : non-empty data
+    source ->> sink : send(SourecAction::Data)
+    source -> source ++ : recv()
+
+    sink --> sink -- : SourceAction::Data
+    sink -> pipe_out ++ : write_all()
+    return Err(BrokenPipe)
+    sink ->> source : SinkAction::SinkClosed
+    sink -> sink ++ : recv()
+    source --> source -- : SinkAction::SinkClosed
+    source ->> sink : SourceAction::SourceClosed
+    sink --> sink -- : SourceAction::SourceClosed
+    |||
+else Pipe (out) closed, but no read operation occurred
+    |||
+    source -> source ++ : recv()
+    sink -> sink ++  : recv()
+    [->> source : SinkAction::SinkClosed
+    source --> source -- : SinkAction::SinkClosed
+    source ->> sink : SourceAction::SourceClosed
+    sink --> sink -- : SourceAction::SourceClosed
+    |||
+end
+destroy source
+destroy sink
+
+@enduml

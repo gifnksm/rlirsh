@@ -1,0 +1,154 @@
+@startuml exec_sequence
+
+box Client Process
+    participant "Main\nTask" as cli_main
+    participant "Receiver\nTask" as cli_recv
+    participant "Sender\nTask" as cli_send
+    participant "Source\nTasks" as cli_src
+    participant "Sink\nTasks" as cli_sink
+end box
+
+box Server Process
+    participant "Main\nTask" as srv_main
+    participant "Serve\nTask" as srv_srv
+    participant "Receiver\nTask" as srv_recv
+    participant "Sender\nTask" as srv_send
+    participant "Source\nTasks" as srv_src
+    participant "Sink\nTasks" as srv_sink
+end box
+
+participant "Executed\nProcess" as proc
+
+activate srv_main
+srv_main -> srv_main ++ : accept()
+
+[->> cli_main ++: start
+cli_main ->> srv_main : connect()
+
+srv_main --> srv_main -- : Ok(socket)
+srv_main ->> srv_srv ++ : spawn()
+srv_main -> srv_main ++ : accept()
+
+srv_srv -> srv_srv ++ : recv_message()
+cli_main ->> srv_srv : send_message\n(Execute)
+srv_srv --> srv_srv -- : Execute
+
+cli_main -> cli_main ++ : recv_message()
+srv_srv ->> proc ++ : Command::new().spawn()
+srv_srv ->> cli_main : send_message\n(Ok)
+cli_main --> cli_main -- : Ok
+
+srv_srv ->> srv_recv ++ : spawn()
+srv_recv -> srv_recv ++ : recv_message()
+srv_srv ->> srv_send ++ : spawn()
+srv_send -> srv_send ++ : recv()
+srv_srv ->> srv_src ++ : spawn()
+srv_srv ->> srv_sink ++ : spawn()
+
+cli_main ->> cli_recv ++ : spawn()
+cli_recv -> cli_recv ++ : recv_message()
+cli_main ->> cli_send ++ : spawn()
+cli_send -> cli_send ++ : recv()
+cli_main ->> cli_src ++ : spawn()
+cli_main ->> cli_sink ++ : spawn()
+
+cli_main -> cli_main ++ : recv()
+srv_srv -> srv_srv ++ : child.wait()
+
+|||
+...
+|||
+
+proc ->> srv_srv : process\nend
+destroy proc
+srv_srv --> srv_srv -- : status
+
+srv_srv ->> srv_send : send\n(SinkClosed)
+srv_send --> srv_send -- : SinkClosed
+srv_send ->> cli_recv : send_message\n(SinkClosed)
+srv_send -> srv_send ++ : recv()
+
+cli_recv --> cli_recv -- : SinkClosed
+cli_recv ->> cli_src : send\n(SinkClosed)
+cli_recv -> cli_recv ++ : recv_message()
+
+cli_src ->> cli_send : send\n(SourceClosed)
+cli_src ->> cli_send : drop(tx)
+cli_src ->> cli_main : task\nend
+destroy cli_src
+
+cli_send --> cli_send -- : SourceClosed
+cli_send ->> srv_recv : send\n(SourceClosed)
+cli_send -> cli_send ++ : recv()
+
+srv_recv --> srv_recv -- : SourceClosed
+srv_recv ->> srv_sink : send\n(SourceClosed)
+srv_recv -> srv_recv ++ : recv_message()
+
+srv_sink ->> srv_send : drop(tx)
+srv_sink ->> srv_srv : task\nend
+destroy srv_sink
+
+srv_srv ->> srv_send : send\n(Exit(status))
+srv_send --> srv_send -- : Exit(status)
+srv_send ->> cli_recv : send_message\n(Exit(status))
+srv_send -> srv_send ++ : recv()
+
+cli_recv --> cli_recv -- : Exit(status)
+cli_recv ->> cli_main : send\n(Exit(status))
+cli_recv -> cli_recv ++ : recv_message()
+
+cli_main --> cli_main -- : Exit(status)
+cli_main -> cli_main ++ : try_join(..)
+
+srv_srv ->> srv_send : drop(tx)
+srv_srv -> srv_srv ++ : try_join(..)
+
+srv_src ->> srv_send : SourceClosed
+srv_src ->> srv_send : drop(tx)
+srv_src ->> srv_srv : task\nend
+destroy srv_src
+
+srv_send --> srv_send -- : SourceClosed
+srv_send --> cli_recv : send_message\n(SourceClosed)
+srv_send -> srv_send ++ : recv()
+
+cli_recv --> cli_recv -- : SourceClosed
+cli_recv ->> cli_sink : send\n(SourceClosed)
+cli_recv -> cli_recv ++ : recv_message()
+
+cli_sink ->> cli_send : drop(tx)
+cli_sink ->> cli_main : task\nend
+destroy cli_sink
+
+srv_send --> srv_send -- : None
+srv_send -> srv_send ++ : notified()
+
+cli_send --> cli_send -- : None
+cli_send ->> srv_recv : send_message\n(Finished)
+cli_send ->> cli_main : task\nend
+destroy cli_send
+
+srv_recv --> srv_recv -- : Finished
+srv_recv ->> srv_send : notify()
+srv_recv ->> srv_srv : task\nend
+destroy srv_recv
+
+srv_send --> srv_send --
+srv_send ->> cli_recv : Finished
+srv_send ->> srv_srv : task\nend
+destroy srv_send
+
+cli_recv --> cli_recv -- : Finished
+cli_recv ->> cli_main : task\nend
+destroy cli_recv
+
+srv_srv --> srv_srv --
+srv_srv ->> srv_main : task\nend
+destroy srv_srv
+
+cli_main --> cli_main --
+[<<- cli_main : exit
+destroy cli_main
+
+@enduml
