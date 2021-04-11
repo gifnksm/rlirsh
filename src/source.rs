@@ -13,11 +13,11 @@ pub(crate) fn new<R, T, F>(
     reader: R,
     tx: mpsc::Sender<T>,
     from_action: F,
-) -> (Sender, Source<R, T, F>) {
+) -> (Sender, Task<R, T, F>) {
     let (sink_tx, rx) = mpsc::channel(1);
     (
         Sender(sink_tx),
-        Source {
+        Task {
             reader,
             tx,
             rx,
@@ -43,14 +43,14 @@ impl Sender {
 }
 
 #[derive(Debug)]
-pub(crate) struct Source<R, T, F> {
+pub(crate) struct Task<R, T, F> {
     reader: R,
     tx: mpsc::Sender<T>,
     rx: mpsc::Receiver<SinkAction>,
     from_action: F,
 }
 
-impl<R, T, F> Source<R, T, F>
+impl<R, T, F> Task<R, T, F>
 where
     R: AsyncRead + Send + 'static,
     T: Debug + Send + Sync + 'static,

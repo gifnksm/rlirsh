@@ -99,10 +99,12 @@ pub(crate) const MAX_STREAM_PACKET_SIZE: usize = 4096;
 
 const MESSAGE_SIZE_LIMIT: u32 = 1024 * 1024; // 1MiB
 
-pub(crate) async fn recv_message<T>(stream: &mut (impl AsyncRead + Unpin)) -> Result<T>
+pub(crate) async fn recv_message<T>(stream: impl AsyncRead) -> Result<T>
 where
     T: for<'a> Deserialize<'a> + 'static,
 {
+    tokio::pin!(stream);
+
     let size = stream
         .read_u32()
         .await
@@ -122,10 +124,12 @@ where
     Ok(data)
 }
 
-pub(crate) async fn send_message<T>(stream: &mut (impl AsyncWrite + Unpin), data: &T) -> Result<()>
+pub(crate) async fn send_message<T>(stream: impl AsyncWrite, data: &T) -> Result<()>
 where
     T: Serialize,
 {
+    tokio::pin!(stream);
+
     let size = bincode::serialized_size(&data)?;
     ensure!(
         size <= u64::from(MESSAGE_SIZE_LIMIT),
