@@ -34,6 +34,12 @@ impl Sender {
         self.0.send(action).await?;
         Ok(())
     }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.send(SourceAction::SourceClosed)
+            .await
+            .wrap_err("failed to shutdown")
+    }
 }
 
 #[derive(Debug)]

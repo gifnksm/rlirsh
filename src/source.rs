@@ -40,6 +40,12 @@ impl Sender {
         }
         Ok(())
     }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.send(SinkAction::SinkClosed)
+            .await
+            .wrap_err("failed to shutdown")
+    }
 }
 
 #[derive(Debug)]

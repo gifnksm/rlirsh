@@ -76,7 +76,8 @@ pub(super) async fn main(args: Args) -> Result<()> {
 
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
-    let (exit_status_tx, exit_status_rx) = oneshot::channel::<ExitStatus>();
+    let (exit_status_tx, exit_status_rx) = oneshot::channel();
+    let (error_tx, error_rx) = mpsc::channel(1);
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
@@ -113,16 +114,27 @@ pub(super) async fn main(args: Args) -> Result<()> {
         s2c_tx_map.insert(kind, tx);
         handlers.push(task.spawn(info_span!("stderr")).boxed());
     }
-    let receiver = receiver::Task::new(reader, c2s_tx_map, s2c_tx_map, exit_status_tx)
+    let receiver = receiver::Task::new(reader, c2s_tx_map, s2c_tx_map, exit_status_tx, error_rx)
         .spawn(info_span!("receiver"));
-    let sender = sender::Task::new(writer, send_msg_rx).spawn(info_span!("sender"));
+    let sender = sender::Task::new(writer, send_msg_rx, error_tx).spawn(info_span!("sender"));
     drop(send_msg_tx);
 
     let status = exit_status_rx.await?;
-    debug!(?status, "exit");
-
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
     debug!("finished");
 
-    Ok(())
+    let exit_code = match status {
+        Ok(status) => {
+            debug!(?status);
+            match status {
+                ExitStatus::Code(code) => code,
+                ExitStatus::Signal(num) => 128 + num,
+            }
+        }
+        Err(err) => {
+            warn!(?err);
+            255
+        }
+    };
+    std::process::exit(exit_code);
 }
