@@ -65,7 +65,8 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let finish_notify = Arc::new(Notify::new());
-    let (error_tx, error_rx) = mpsc::channel(1);
+    let (send_error_tx, send_error_rx) = mpsc::channel(1);
+    let (kill_error_tx, mut kill_error_rx) = mpsc::channel(1);
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
@@ -102,31 +103,42 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
         c2s_tx_map,
         s2c_tx_map,
         finish_notify.clone(),
-        error_rx,
+        send_error_rx,
+        kill_error_tx,
     )
     .spawn(info_span!("receiver"));
-    let sender =
-        sender::Task::new(writer, send_msg_rx, finish_notify, error_tx).spawn(info_span!("sender"));
+    let sender = sender::Task::new(writer, send_msg_rx, finish_notify, send_error_tx)
+        .spawn(info_span!("sender"));
 
-    let status = child.wait().await?;
-    let status = if let Some(code) = status.code() {
-        ExitStatus::Code(code)
-    } else if let Some(signal) = status.signal() {
-        ExitStatus::Signal(signal)
-    } else {
-        unreachable!()
+    tokio::select! {
+        status = child.wait() => {
+            let status = status?;
+            let status = if let Some(code) = status.code() {
+                ExitStatus::Code(code)
+            } else if let Some(signal) = status.signal() {
+                ExitStatus::Signal(signal)
+            } else {
+                unreachable!()
+            };
+            info!(?status, "process finished");
+            // Notifies the client that the standard input pipe connected to the child process is closed.
+            // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
+            // does not support such an operation, so send a message to the client to alternate it.
+            for kind in c2s_kinds {
+                send_msg_tx
+                    .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
+                    .await
+                    .wrap_err("failed to send message")?;
+            }
+            send_msg_tx.send(ServerAction::Exit(status)).await?;
+        }
+        Some(err) = kill_error_rx.recv() => {
+            warn!(?err);
+            if let Err(err) = child.kill().await {
+                warn!(?err, "failed to kill the process");
+            }
+        }
     };
-    info!(?status, "process finished");
-    // Notifies the client that the standard input pipe connected to the child process is closed.
-    // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
-    // does not support such an operation, so send a message to the client to alternate it.
-    for kind in c2s_kinds {
-        send_msg_tx
-            .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
-            .await
-            .wrap_err("failed to send message")?;
-    }
-    send_msg_tx.send(ServerAction::Exit(status)).await?;
     drop(send_msg_tx);
 
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;

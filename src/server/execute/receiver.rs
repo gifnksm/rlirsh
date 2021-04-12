@@ -6,7 +6,10 @@ use crate::{
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::AsyncRead,
-    sync::{mpsc::Receiver, Notify},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Notify,
+    },
 };
 use tracing::Span;
 
@@ -16,7 +19,8 @@ pub(super) struct Task<R> {
     c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
     s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
     finish_notify: Arc<Notify>,
-    error_rx: Receiver<Error>,
+    send_error_rx: Receiver<Error>,
+    kill_error_tx: Sender<Error>,
 }
 
 impl<R> Task<R>
@@ -28,14 +32,16 @@ where
         c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
         s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
         finish_notify: Arc<Notify>,
-        error_rx: Receiver<Error>,
+        send_error_rx: Receiver<Error>,
+        kill_error_tx: Sender<Error>,
     ) -> Self {
         Self {
             reader,
             c2s_tx_map,
             s2c_tx_map,
             finish_notify,
-            error_rx,
+            send_error_rx,
+            kill_error_tx,
         }
     }
 
@@ -51,22 +57,23 @@ where
             c2s_tx_map,
             s2c_tx_map,
             finish_notify,
-            mut error_rx,
+            mut send_error_rx,
+            kill_error_tx,
         } = self;
         tokio::pin!(reader);
 
         trace!("started");
-        let mut receive_failed = false;
+        let mut receive_failed = None;
         loop {
             let res = tokio::select! {
                 res = protocol::recv_message(&mut reader) => res,
-                Some(res) = error_rx.recv() => Err(res), // error reported from sender task
+                Some(res) = send_error_rx.recv() => Err(res), // error reported from sender task
             };
             let message = match res {
                 Ok(message) => message,
                 Err(err) => {
                     debug!(?err);
-                    receive_failed = true;
+                    receive_failed = Some(err);
                     break;
                 }
             };
@@ -91,7 +98,7 @@ where
                 ClientAction::Finished => break,
             }
         }
-        if receive_failed {
+        if let Some(err) = receive_failed {
             // If error occurred, shutdown all handlers on this process
             for (kind, tx) in &s2c_tx_map {
                 if let Err(err) = tx.shutdown().instrument(info_span!("source", ?kind)).await {
@@ -102,6 +109,12 @@ where
                 if let Err(err) = tx.shutdown().instrument(info_span!("client", ?kind)).await {
                     debug!(?err);
                 }
+            }
+            if let Err(err) = kill_error_tx
+                .send(err.wrap_err("connection disconnected unexpectedly"))
+                .await
+            {
+                debug!(?err);
             }
         }
         finish_notify.notify_one();
