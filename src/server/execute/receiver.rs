@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::{io::AsyncRead, sync::Notify};
 use tracing::Span;
 
+#[derive(Debug)]
 pub(super) struct Task<R> {
     reader: R,
     c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,

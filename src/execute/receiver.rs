@@ -10,6 +10,7 @@ use tokio::{
 };
 use tracing::Span;
 
+#[derive(Debug)]
 pub(super) struct Task<R> {
     reader: R,
     c2s_tx_map: HashMap<C2sStreamKind, source::Sender>,

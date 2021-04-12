@@ -9,6 +9,7 @@ use tokio::{
 };
 use tracing::Span;
 
+#[derive(Debug)]
 pub(super) struct Task<W> {
     writer: W,
     rx: Receiver<ServerAction>,
