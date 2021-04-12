@@ -65,6 +65,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let finish_notify = Arc::new(Notify::new());
+    let (error_tx, error_rx) = mpsc::channel(1);
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
@@ -96,9 +97,16 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     }
 
     let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
-    let receiver = receiver::Task::new(reader, c2s_tx_map, s2c_tx_map, finish_notify.clone())
-        .spawn(info_span!("receiver"));
-    let sender = sender::Task::new(writer, send_msg_rx, finish_notify).spawn(info_span!("sender"));
+    let receiver = receiver::Task::new(
+        reader,
+        c2s_tx_map,
+        s2c_tx_map,
+        finish_notify.clone(),
+        error_rx,
+    )
+    .spawn(info_span!("receiver"));
+    let sender =
+        sender::Task::new(writer, send_msg_rx, finish_notify, error_tx).spawn(info_span!("sender"));
 
     let status = child.wait().await?;
     let status = if let Some(code) = status.code() {
