@@ -1,6 +1,7 @@
+use futures_util::ready;
 use std::{
     fs::OpenOptions,
-    io::{Error, ErrorKind, Result},
+    io::{Error, Result},
     os::unix::{
         io::{AsRawFd, IntoRawFd, RawFd},
         prelude::OpenOptionsExt,
@@ -34,34 +35,24 @@ impl AsyncRead for Stdin {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<Result<()>> {
         loop {
-            let mut ready = match self.0.poll_read_ready(cx) {
-                Poll::Ready(x) => x?,
-                Poll::Pending => return Poll::Pending,
-            };
-
-            let ret = unsafe {
-                libc::read(
-                    self.as_raw_fd(),
-                    buf.unfilled_mut() as *mut _ as _,
-                    buf.remaining(),
-                )
-            };
-
-            if ret < 0 {
-                let e = Error::last_os_error();
-                if e.kind() == ErrorKind::WouldBlock {
-                    ready.clear_ready();
-                    continue;
-                }
-                return Poll::Ready(Err(e));
+            let mut ready = ready!(self.0.poll_read_ready(cx))?;
+            match ready.try_io(|inner| read(inner.as_raw_fd(), buf)) {
+                Ok(res) => return Poll::Ready(res),
+                Err(_would_block) => continue,
             }
-
-            let n = ret as usize;
-            unsafe {
-                buf.assume_init(n);
-            }
-            buf.advance(n);
-            return Poll::Ready(Ok(()));
         }
     }
+}
+
+fn read(fd: RawFd, buf: &mut tokio::io::ReadBuf<'_>) -> Result<()> {
+    let ret = unsafe { libc::read(fd, buf.unfilled_mut() as *mut _ as _, buf.remaining()) };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    let n = ret as usize;
+    unsafe {
+        buf.assume_init(n);
+    }
+    buf.advance(n);
+    Ok(())
 }
