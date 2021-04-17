@@ -7,7 +7,7 @@ use crate::{
     sink, source,
     stdin::Stdin,
 };
-use argh::FromArgs;
+use clap::Clap;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -23,17 +23,14 @@ mod receiver;
 mod sender;
 
 /// Execute command
-#[derive(Debug, FromArgs)]
-#[argh(subcommand, name = "exec")]
+#[derive(Debug, Clap)]
 pub(super) struct Args {
     /// server host and port to connect
-    #[argh(positional, from_str_fn(parse_addr))]
+    #[clap(parse(try_from_str = parse_addr))]
     host: SocketAddr,
     /// command to execute on remote host
-    #[argh(positional)]
     cmd: String,
     /// command arguments
-    #[argh(positional)]
     args: Vec<String>,
 }
 

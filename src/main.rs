@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use argh::FromArgs;
+use clap::Clap;
 use std::fmt::Debug;
 
 mod execute;
@@ -11,14 +11,13 @@ mod source;
 mod stdin;
 
 /// Rootless insecure remote shell
-#[derive(Debug, FromArgs)]
+#[derive(Debug, Clap)]
 struct Args {
-    #[argh(subcommand)]
+    #[clap(subcommand)]
     command: SubCommand,
 }
 
-#[derive(Debug, FromArgs)]
-#[argh(subcommand)]
+#[derive(Debug, Clap)]
 enum SubCommand {
     Server(server::Args),
     Execute(execute::Args),
@@ -40,7 +39,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
 
-    let args = argh::from_env::<Args>();
+    let args = Args::parse();
     match args.command {
         SubCommand::Server(server_args) => server::main(server_args).await?,
         SubCommand::Execute(execute_args) => execute::main(execute_args).await?,

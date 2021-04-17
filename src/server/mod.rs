@@ -2,21 +2,19 @@ use crate::{
     prelude::*,
     protocol::{self, Request},
 };
-use argh::FromArgs;
+use clap::Clap;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpSocket, TcpStream};
 
 mod execute;
 
 /// Launch rlirsh server
-#[derive(Debug, FromArgs)]
-#[argh(subcommand, name = "server")]
+#[derive(Debug, Clap)]
 pub(super) struct Args {
     /// alternative bind address [default: 0.0.0.0]
-    #[argh(option, default = "std::net::Ipv4Addr::new(0, 0, 0, 0).into()")]
+    #[clap(long = "bind", default_value = "0.0.0.0")]
     bind: IpAddr,
     /// port number to bind
-    #[argh(positional)]
     port: u16,
 }
 
