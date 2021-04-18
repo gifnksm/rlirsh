@@ -1,27 +1,29 @@
 use crate::{
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ExecuteRequest, ExecuteResponse, ExitStatus, S2cStreamKind,
-        ServerAction, SinkAction,
+        self, C2sStreamKind, ExecuteCommand, ExecuteRequest, ExecuteResponse, ExitStatus,
+        S2cStreamKind, ServerAction, SinkAction, SourceAction,
     },
     sink, source,
 };
 use etc_passwd::Passwd;
 use std::{
-    collections::HashMap, env, ffi::OsString, os::unix::prelude::ExitStatusExt, process::Stdio,
-    sync::Arc,
+    collections::HashMap, env, ffi::OsString, os::unix::prelude::ExitStatusExt,
+    os::unix::process::CommandExt, process::Command as StdCommand, process::Stdio, sync::Arc,
 };
 use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
     process::Command,
     sync::{mpsc, Notify},
 };
+use tokio_pty_command::{CommandExt as _, PtyMaster};
 
 mod receiver;
 mod sender;
 
 pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<()> {
-    info!(?req.cmd, ?req.args, "serve request");
+    info!(?req.command, "serve request");
     let shell = if let Some(passwd) = Passwd::current_user()? {
         OsString::from(passwd.shell.to_str()?)
     } else if let Some(shell) = env::var_os("SHELL") {
@@ -29,21 +31,39 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     } else {
         bail!("cannot get login shell for the user")
     };
-    let cmd = if req.args.is_empty() {
-        req.cmd.clone()
+    let mut arg0 = OsString::from("-");
+    arg0.push(&shell);
+
+    let mut builder = StdCommand::new(&shell);
+    builder.arg0(arg0);
+    match req.command {
+        ExecuteCommand::LoginShell => {}
+        ExecuteCommand::Program { command } => {
+            builder.arg("-c");
+            builder.arg(command.join(" "));
+        }
+    }
+
+    builder.env_clear();
+    builder.envs(req.envs.iter().map(|(a, b)| (a, b)));
+
+    let mut builder = Command::from(builder);
+    builder.kill_on_drop(true);
+
+    let child;
+    let pty_master;
+    if req.allocate_pty {
+        let pty = PtyMaster::open().wrap_err("failed to open pty master")?;
+        child = builder.spawn_with_pty(&pty);
+        pty_master = Some(pty);
     } else {
-        req.cmd.clone() + " " + &req.args.join(" ")
-    };
-    let child = Command::new(&shell)
-        .arg("-c")
-        .arg(cmd)
-        .env_clear()
-        .envs(req.envs.iter().map(|(a, b)| (a, b)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
+        builder
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        child = builder.spawn();
+        pty_master = None;
+    }
 
     let mut child = match child {
         Ok(child) => {
@@ -60,6 +80,23 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
         }
     };
 
+    let stdin: Option<Box<dyn AsyncWrite + Send + Unpin>>;
+    let stdout: Option<Box<dyn AsyncRead + Send + Unpin>>;
+    let stderr: Option<Box<dyn AsyncRead + Send + Unpin>>;
+    let close_source_on_exit;
+    if let Some(pty_master) = pty_master {
+        let (read, write) = io::split(pty_master);
+        stdin = Some(Box::new(write) as _);
+        stdout = Some(Box::new(read) as _);
+        stderr = None;
+        close_source_on_exit = true;
+    } else {
+        stdin = child.stdin.take().map(|x| Box::new(x) as _);
+        stdout = child.stdout.take().map(|x| Box::new(x) as _);
+        stderr = child.stderr.take().map(|x| Box::new(x) as _);
+        close_source_on_exit = false;
+    }
+
     info!(id = ?child.id(), "spawned");
 
     let (reader, writer) = stream.into_split();
@@ -72,36 +109,59 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let mut s2c_tx_map = HashMap::new();
     let mut handlers = vec![];
 
-    if let Some(stdin) = child.stdin.take() {
+    if let Some(stdin) = stdin {
         let kind = C2sStreamKind::Stdin;
         let (tx, task) = sink::new(stdin, send_msg_tx.clone(), move |action| {
             ServerAction::SinkAction(kind, action)
         });
         c2s_tx_map.insert(kind, tx);
         handlers.push(task.spawn(info_span!("stdin")).boxed());
+    } else {
+        send_msg_tx
+            .send(ServerAction::SinkAction(
+                C2sStreamKind::Stdin,
+                SinkAction::SinkClosed,
+            ))
+            .await?;
     }
-    if let Some(stdout) = child.stdout.take() {
+
+    if let Some(stdout) = stdout {
         let kind = S2cStreamKind::Stdout;
         let (tx, task) = source::new(stdout, send_msg_tx.clone(), move |action| {
             ServerAction::SourceAction(kind, action)
         });
         s2c_tx_map.insert(kind, tx);
         handlers.push(task.spawn(info_span!("stdout")).boxed());
+    } else {
+        send_msg_tx
+            .send(ServerAction::SourceAction(
+                S2cStreamKind::Stdout,
+                SourceAction::SourceClosed,
+            ))
+            .await?;
     }
-    if let Some(stderr) = child.stderr.take() {
+
+    if let Some(stderr) = stderr {
         let kind = S2cStreamKind::Stderr;
         let (tx, task) = source::new(stderr, send_msg_tx.clone(), move |action| {
             ServerAction::SourceAction(kind, action)
         });
         s2c_tx_map.insert(kind, tx);
         handlers.push(task.spawn(info_span!("stderr")).boxed());
+    } else {
+        send_msg_tx
+            .send(ServerAction::SourceAction(
+                S2cStreamKind::Stderr,
+                SourceAction::SourceClosed,
+            ))
+            .await?;
     }
 
     let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
     let receiver = receiver::Task::new(
         reader,
         c2s_tx_map,
-        s2c_tx_map,
+        s2c_tx_map.clone(),
         finish_notify.clone(),
         send_error_rx,
         kill_error_tx,
@@ -129,6 +189,11 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
                     .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
                     .await
                     .wrap_err("failed to send message")?;
+            }
+            if close_source_on_exit {
+                for (_kind, tx) in s2c_tx_map {
+                    tx.send(SinkAction::SinkClosed).await.wrap_err("failed to send message")?;
+                }
             }
             send_msg_tx.send(ServerAction::Exit(status)).await?;
         }

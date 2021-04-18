@@ -1,17 +1,21 @@
 use crate::{
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ClientAction, ExecuteRequest, ExecuteResponse, ExitStatus, Request,
-        S2cStreamKind,
+        self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
+        ExitStatus, Request, S2cStreamKind,
     },
     sink, source,
     stdin::Stdin,
+    terminal::RawMode,
 };
 use clap::Clap;
 use std::{
     collections::HashMap,
+    env,
     fmt::Debug,
     net::{SocketAddr, ToSocketAddrs},
+    panic,
+    sync::Arc,
 };
 use tokio::{
     fs::File,
@@ -29,9 +33,7 @@ pub(super) struct Args {
     #[clap(parse(try_from_str = parse_addr))]
     host: SocketAddr,
     /// command to execute on remote host
-    cmd: String,
-    /// command arguments
-    args: Vec<String>,
+    command: Vec<String>,
 }
 
 fn parse_addr(s: &str) -> Result<SocketAddr, String> {
@@ -51,10 +53,25 @@ pub(super) async fn main(args: Args) -> Result<()> {
     debug!(%args.host, "connect");
 
     let mut stream = socket.connect(args.host).await?;
+    let command;
+    let allocate_pty;
+    let mut envs = vec![];
+    if args.command.is_empty() {
+        command = ExecuteCommand::LoginShell;
+        allocate_pty = true;
+        if let Ok(term) = env::var("TERM") {
+            envs.push(("TERM".into(), term));
+        }
+    } else {
+        command = ExecuteCommand::Program {
+            command: args.command,
+        };
+        allocate_pty = false;
+    };
     let req = Request::Execute(ExecuteRequest {
-        cmd: args.cmd,
-        args: args.args,
-        envs: vec![],
+        command,
+        envs,
+        allocate_pty,
     });
     protocol::send_message(&mut stream, &req)
         .await
@@ -66,6 +83,22 @@ pub(super) async fn main(args: Args) -> Result<()> {
         bail!(message);
     }
     debug!("command started");
+
+    let raw_mode = Arc::new(RawMode::new());
+    {
+        let raw_mode = raw_mode.clone();
+        let saved_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let left = raw_mode.leave().expect("failed to restore terminal mode");
+            if left {
+                trace!("escape from raw mode");
+            }
+            saved_hook(info);
+        }));
+    }
+    if allocate_pty {
+        raw_mode.enter()?;
+    }
 
     let send_stdin = true;
     let send_stdout = true;
@@ -119,6 +152,8 @@ pub(super) async fn main(args: Args) -> Result<()> {
     let status = exit_status_rx.await?;
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
     debug!("finished");
+
+    raw_mode.leave()?;
 
     let exit_code = match status {
         Ok(status) => {

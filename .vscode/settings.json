@@ -7,6 +7,7 @@
         "addrs",
         "argh",
         "bincode",
+        "cfmakeraw",
         "errno",
         "fcntl",
         "fileno",
@@ -21,6 +22,10 @@
         "rlirsh",
         "setsid",
         "subcommand",
+        "tcgetattr",
+        "tcsaflush",
+        "tcsetattr",
+        "termios",
         "tiocsctty",
         "unistd",
         "unlockpt"

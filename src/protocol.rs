@@ -10,9 +10,15 @@ pub(crate) enum Request {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ExecuteRequest {
-    pub(crate) cmd: String,
-    pub(crate) args: Vec<String>,
+    pub(crate) command: ExecuteCommand,
     pub(crate) envs: Vec<(String, String)>,
+    pub(crate) allocate_pty: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ExecuteCommand {
+    LoginShell,
+    Program { command: Vec<String> },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

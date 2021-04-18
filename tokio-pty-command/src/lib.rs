@@ -6,6 +6,7 @@ mod pty_master;
 
 pub type Error = io::Error;
 pub type Result<T> = io::Result<T>;
+pub use command_ext::*;
 pub use pty_master::*;
 
 trait IntoStd {
