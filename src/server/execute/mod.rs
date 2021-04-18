@@ -4,7 +4,7 @@ use crate::{
         self, C2sStreamKind, ExecuteCommand, ExecuteRequest, ExecuteResponse, ExitStatus,
         S2cStreamKind, ServerAction, SinkAction, SourceAction,
     },
-    sink, source,
+    sink, source, terminal,
 };
 use etc_passwd::Passwd;
 use std::{
@@ -52,9 +52,11 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
 
     let child;
     let pty_master;
-    if req.allocate_pty {
+    if let Some(param) = req.pty_param {
         let pty = PtyMaster::open().wrap_err("failed to open pty master")?;
         child = builder.spawn_with_pty(&pty);
+        terminal::set_window_size(&pty, param.width, param.height)
+            .wrap_err("failed to set window size")?;
         pty_master = Some(pty);
     } else {
         builder

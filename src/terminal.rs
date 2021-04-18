@@ -1,5 +1,30 @@
-use crate::Result;
+use crate::{ioctl, Result};
 use parking_lot::Mutex;
+use std::{mem, os::unix::prelude::AsRawFd};
+
+pub(crate) fn get_window_size(fd: &impl AsRawFd) -> Result<(u16, u16)> {
+    let fd = fd.as_raw_fd();
+    let winsz = unsafe {
+        let mut winsz = mem::zeroed();
+        ioctl::tiocgwinsz(fd, &mut winsz)?;
+        winsz
+    };
+    Ok((winsz.ws_col, winsz.ws_row))
+}
+
+pub(crate) fn set_window_size(fd: &impl AsRawFd, w: u16, h: u16) -> Result<()> {
+    let fd = fd.as_raw_fd();
+    let winsz = libc::winsize {
+        ws_col: w,
+        ws_row: h,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        ioctl::tiocswinsz(fd, &winsz)?;
+    };
+    Ok(())
+}
 
 static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
     parking_lot::lock_api::RawMutex::INIT,

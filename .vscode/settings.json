@@ -26,9 +26,15 @@
         "tcsaflush",
         "tcsetattr",
         "termios",
+        "tiocgwinsz",
         "tiocsctty",
+        "tiocswinsz",
         "unistd",
-        "unlockpt"
+        "unlockpt",
+        "winsize",
+        "winsz",
+        "xpixel",
+        "ypixel"
     ],
     "plantuml.diagramsRoot": "design/src",
     "plantuml.exportFormat": "svg",

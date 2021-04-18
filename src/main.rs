@@ -3,6 +3,7 @@ use clap::Clap;
 use std::fmt::Debug;
 
 mod execute;
+mod ioctl;
 mod prelude;
 mod protocol;
 mod server;

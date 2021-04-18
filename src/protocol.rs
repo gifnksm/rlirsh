@@ -12,13 +12,19 @@ pub(crate) enum Request {
 pub(crate) struct ExecuteRequest {
     pub(crate) command: ExecuteCommand,
     pub(crate) envs: Vec<(String, String)>,
-    pub(crate) allocate_pty: bool,
+    pub(crate) pty_param: Option<PtyParam>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum ExecuteCommand {
     LoginShell,
     Program { command: Vec<String> },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct PtyParam {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

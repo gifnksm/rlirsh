@@ -2,13 +2,15 @@ use crate::{
     prelude::*,
     protocol::{
         self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
-        ExitStatus, Request, S2cStreamKind,
+        ExitStatus, PtyParam, Request, S2cStreamKind,
     },
     sink, source,
     stdin::Stdin,
+    terminal,
     terminal::RawMode,
 };
 use clap::Clap;
+use nix::libc;
 use std::{
     collections::HashMap,
     env,
@@ -54,11 +56,13 @@ pub(super) async fn main(args: Args) -> Result<()> {
 
     let mut stream = socket.connect(args.host).await?;
     let command;
-    let allocate_pty;
+    let pty_param;
     let mut envs = vec![];
     if args.command.is_empty() {
+        let (width, height) =
+            terminal::get_window_size(&libc::STDIN_FILENO).wrap_err("failed to get window size")?;
         command = ExecuteCommand::LoginShell;
-        allocate_pty = true;
+        pty_param = Some(PtyParam { width, height });
         if let Ok(term) = env::var("TERM") {
             envs.push(("TERM".into(), term));
         }
@@ -66,12 +70,13 @@ pub(super) async fn main(args: Args) -> Result<()> {
         command = ExecuteCommand::Program {
             command: args.command,
         };
-        allocate_pty = false;
+        pty_param = None;
     };
+    let allocate_pty = pty_param.is_some();
     let req = Request::Execute(ExecuteRequest {
         command,
         envs,
-        allocate_pty,
+        pty_param,
     });
     protocol::send_message(&mut stream, &req)
         .await
