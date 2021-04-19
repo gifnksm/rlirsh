@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
-    process::Command,
+    process::{Child, Command},
     sync::{mpsc, Notify},
 };
 use tokio_pty_command::{CommandExt as _, PtyMaster};
@@ -22,15 +22,50 @@ use tokio_pty_command::{CommandExt as _, PtyMaster};
 mod receiver;
 mod sender;
 
-pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<()> {
+struct ServeParam {
+    child: Child,
+    stdin: Option<Box<dyn AsyncWrite + Send + Unpin>>,
+    stdout: Option<Box<dyn AsyncRead + Send + Unpin>>,
+    stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
+}
+
+pub(super) async fn main(mut stream: TcpStream, req: ExecuteRequest) -> Result<()> {
     info!(?req.command, "serve request");
-    let shell = if let Some(passwd) = Passwd::current_user()? {
+
+    let res = spawn_process(req).wrap_err("failed to start process");
+    let param = match res {
+        Ok(res) => {
+            protocol::send_message(&mut stream, &ExecuteResponse::Ok)
+                .await
+                .wrap_err("failed to send response")?;
+            res
+        }
+        Err(err) => {
+            protocol::send_message(&mut stream, &ExecuteResponse::Err(err.to_string()))
+                .await
+                .wrap_err("failed to send response")?;
+            bail!(err);
+        }
+    };
+
+    info!(id = ?param.child.id(), "spawned");
+
+    serve(stream, param).await?;
+
+    info!("serve finished");
+
+    Ok(())
+}
+
+fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
+    let shell = if let Some(passwd) = Passwd::current_user().ok().flatten() {
         OsString::from(passwd.shell.to_str()?)
     } else if let Some(shell) = env::var_os("SHELL") {
         shell
     } else {
         bail!("cannot get login shell for the user")
     };
+
     let mut arg0 = OsString::from("-");
     arg0.push(&shell);
 
@@ -50,11 +85,13 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let mut builder = Command::from(builder);
     builder.kill_on_drop(true);
 
-    let child;
+    let mut child;
     let pty_master;
     if let Some(param) = req.pty_param {
         let pty = PtyMaster::open().wrap_err("failed to open pty master")?;
-        child = builder.spawn_with_pty(&pty);
+        child = builder
+            .spawn_with_pty(&pty)
+            .wrap_err("failed to spawn process")?;
         terminal::set_window_size(&pty, param.width, param.height)
             .wrap_err("failed to set window size")?;
         pty_master = Some(pty);
@@ -63,44 +100,35 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        child = builder.spawn();
+        child = builder.spawn().wrap_err("failed to spawn process")?;
         pty_master = None;
     }
 
-    let mut child = match child {
-        Ok(child) => {
-            protocol::send_message(&mut stream, &ExecuteResponse::Ok)
-                .await
-                .wrap_err("failed to send response")?;
-            child
-        }
-        Err(err) => {
-            protocol::send_message(&mut stream, &ExecuteResponse::Err(err.to_string()))
-                .await
-                .wrap_err("failed to send response")?;
-            bail!(err);
-        }
-    };
-
-    let stdin: Option<Box<dyn AsyncWrite + Send + Unpin>>;
-    let stdout: Option<Box<dyn AsyncRead + Send + Unpin>>;
-    let stderr: Option<Box<dyn AsyncRead + Send + Unpin>>;
-    let close_source_on_exit;
+    let stdin;
+    let stdout;
+    let stderr;
     if let Some(pty_master) = pty_master {
         let (read, write) = io::split(pty_master);
         stdin = Some(Box::new(write) as _);
         stdout = Some(Box::new(read) as _);
         stderr = None;
-        close_source_on_exit = true;
     } else {
         stdin = child.stdin.take().map(|x| Box::new(x) as _);
         stdout = child.stdout.take().map(|x| Box::new(x) as _);
         stderr = child.stderr.take().map(|x| Box::new(x) as _);
-        close_source_on_exit = false;
     }
 
-    info!(id = ?child.id(), "spawned");
+    let param = ServeParam {
+        child,
+        stdin,
+        stdout,
+        stderr,
+    };
 
+    Ok(param)
+}
+
+async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let finish_notify = Arc::new(Notify::new());
@@ -111,7 +139,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let mut s2c_tx_map = HashMap::new();
     let mut handlers = vec![];
 
-    if let Some(stdin) = stdin {
+    if let Some(stdin) = param.stdin {
         let kind = C2sStreamKind::Stdin;
         let (tx, task) = sink::new(stdin, send_msg_tx.clone(), move |action| {
             ServerAction::SinkAction(kind, action)
@@ -127,7 +155,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
             .await?;
     }
 
-    if let Some(stdout) = stdout {
+    if let Some(stdout) = param.stdout {
         let kind = S2cStreamKind::Stdout;
         let (tx, task) = source::new(stdout, send_msg_tx.clone(), move |action| {
             ServerAction::SourceAction(kind, action)
@@ -143,7 +171,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
             .await?;
     }
 
-    if let Some(stderr) = stderr {
+    if let Some(stderr) = param.stderr {
         let kind = S2cStreamKind::Stderr;
         let (tx, task) = source::new(stderr, send_msg_tx.clone(), move |action| {
             ServerAction::SourceAction(kind, action)
@@ -163,7 +191,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     let receiver = receiver::Task::new(
         reader,
         c2s_tx_map,
-        s2c_tx_map.clone(),
+        s2c_tx_map,
         finish_notify.clone(),
         send_error_rx,
         kill_error_tx,
@@ -173,7 +201,7 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
         .spawn(info_span!("sender"));
 
     tokio::select! {
-        status = child.wait() => {
+        status = param.child.wait() => {
             let status = status?;
             let status = if let Some(code) = status.code() {
                 ExitStatus::Code(code)
@@ -185,23 +213,19 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
             info!(?status, "process finished");
             // Notifies the client that the standard input pipe connected to the child process is closed.
             // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
-            // does not support such an operation, so send a message to the client to alternate it.
+            // does not support such an operation [1], so send a message to the client to alternate it.
+            // [1]: https://github.com/tokio-rs/tokio/issues/3467
             for kind in c2s_kinds {
                 send_msg_tx
                     .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
                     .await
                     .wrap_err("failed to send message")?;
             }
-            if close_source_on_exit {
-                for (_kind, tx) in s2c_tx_map {
-                    tx.send(SinkAction::SinkClosed).await.wrap_err("failed to send message")?;
-                }
-            }
             send_msg_tx.send(ServerAction::Exit(status)).await?;
         }
         Some(err) = kill_error_rx.recv() => {
             warn!(?err);
-            if let Err(err) = child.kill().await {
+            if let Err(err) = param.child.kill().await {
                 warn!(?err, "failed to kill the process");
             }
         }
@@ -209,7 +233,6 @@ pub(super) async fn serve(mut stream: TcpStream, req: ExecuteRequest) -> Result<
     drop(send_msg_tx);
 
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
-    info!("serve finished");
 
     Ok(())
 }

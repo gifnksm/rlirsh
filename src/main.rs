@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use clap::Clap;
-use std::fmt::Debug;
+use std::{process,fmt::Debug};
 
 mod execute;
 mod ioctl;
@@ -42,10 +42,16 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let args = Args::parse();
-    match args.command {
-        SubCommand::Server(server_args) => server::main(server_args).await?,
-        SubCommand::Execute(execute_args) => execute::main(execute_args).await?,
-    }
+    let res = match args.command {
+        SubCommand::Server(server_args) => server::main(server_args).await,
+        SubCommand::Execute(execute_args) => execute::main(execute_args).await,
+    };
 
-    Ok(())
+    match res {
+        Ok(exit_code) => process::exit(exit_code),
+        Err(err) => {
+            warn!(?err);
+            process::exit(255);
+        }
+    }
 }

@@ -32,11 +32,8 @@ pub(crate) struct Sender(mpsc::Sender<SinkAction>);
 impl Sender {
     pub(crate) async fn send(&self, action: SinkAction) -> Result<()> {
         if let Err(err) = self.0.send(action).await {
-            // SinkClosed may be sent after the source closed, so ignore it.
+            // SinkAction::{Ack, SinkClosed} may be sent after the source closed, so ignore it.
             debug!(?err);
-            if !matches!(err.0, SinkAction::SinkClosed) {
-                bail!(err)
-            }
         }
         Ok(())
     }
@@ -82,10 +79,17 @@ where
         loop {
             tokio::select! {
                 size = reader.read(&mut buf) => {
-                    let size = size.wrap_err("failed to receive message")?;
-                    if size == 0 {
-                        break;
-                    }
+                    let size = match size {
+                        Ok(0) => {
+                            debug!("pipe closed");
+                            break
+                        },
+                        Ok(n) => n,
+                        Err(err) => {
+                            debug!(?err, "error occurred while reading the pipe");
+                            break;
+                        }
+                    };
                     trace!(%size, "bytes read");
 
                     let message = SourceAction::Data(buf[..size].into());

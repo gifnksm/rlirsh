@@ -18,7 +18,7 @@ pub(super) struct Args {
     port: u16,
 }
 
-pub(super) async fn main(args: Args) -> Result<()> {
+pub(super) async fn main(args: Args) -> Result<i32> {
     let addr = SocketAddr::new(args.bind, args.port);
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
@@ -27,12 +27,14 @@ pub(super) async fn main(args: Args) -> Result<()> {
     }?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
+
     let listener = socket.listen(1024)?;
+
     info!("start listening on {:?}", addr);
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                info!(%peer_addr, "connected");
+                info!(%peer_addr, "connection accepted");
                 tokio::spawn(
                     async move {
                         if let Err(err) = serve(stream).await {
@@ -55,7 +57,7 @@ async fn serve(mut stream: TcpStream) -> Result<()> {
         .await
         .wrap_err("failed to receive request")?;
     match request {
-        Request::Execute(req) => execute::serve(stream, req).await?,
+        Request::Execute(req) => execute::main(stream, req).await?,
     }
     Ok(())
 }

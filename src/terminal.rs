@@ -1,6 +1,6 @@
-use crate::{ioctl, Result};
+use crate::{ioctl, prelude::*};
 use parking_lot::Mutex;
-use std::{mem, os::unix::prelude::AsRawFd};
+use std::{mem, os::unix::prelude::AsRawFd, panic};
 
 pub(crate) fn get_window_size(fd: &impl AsRawFd) -> Result<(u16, u16)> {
     let fd = fd.as_raw_fd();
@@ -31,29 +31,42 @@ static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
     imp::RawMode::new(libc::STDIN_FILENO),
 );
 
-pub(crate) struct RawMode {}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        self.leave().expect("failed to restore terminal mode");
-    }
+pub(crate) fn enter_raw_mode() -> Result<bool> {
+    let mut raw_mode = RAW_MODE.lock();
+    let entered = raw_mode.enter()?;
+    Ok(entered)
 }
 
-impl RawMode {
-    pub(crate) fn new() -> Self {
-        RawMode {}
-    }
+pub(crate) fn enter_raw_mode_scoped() -> Result<RawModeGuard> {
+    enter_raw_mode()?;
+    Ok(RawModeGuard {})
+}
 
-    pub(crate) fn enter(&self) -> Result<bool> {
-        let mut raw_mode = RAW_MODE.lock();
-        let entered = raw_mode.enter()?;
-        Ok(entered)
-    }
+pub(crate) fn leave_raw_mode() -> Result<bool> {
+    let mut raw_mode = RAW_MODE.lock();
+    let left = raw_mode.leave()?;
+    Ok(left)
+}
 
-    pub(crate) fn leave(&self) -> Result<bool> {
+pub(crate) fn leave_raw_mode_on_panic() {
+    let saved_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
         let mut raw_mode = RAW_MODE.lock();
-        let left = raw_mode.leave()?;
-        Ok(left)
+        let left = raw_mode.leave().expect("failed to restore terminal mode");
+        if left {
+            debug!("escape from raw mode");
+        }
+        saved_hook(info);
+    }));
+}
+
+#[must_use]
+#[derive(Debug)]
+pub(crate) struct RawModeGuard {}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        leave_raw_mode().expect("failed to restore terminal mode");
     }
 }
 
