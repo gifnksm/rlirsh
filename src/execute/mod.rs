@@ -6,7 +6,7 @@ use crate::{
     },
     sink, source,
     stdin::Stdin,
-    terminal,
+    terminal::{self, raw_mode},
 };
 use clap::Clap;
 use nix::libc;
@@ -90,10 +90,10 @@ pub(super) async fn main(args: Args) -> Result<i32> {
 
     debug!("command started");
 
-    terminal::leave_raw_mode_on_panic();
+    raw_mode::leave_on_panic();
     let _raw_mode = param
         .allocate_pty
-        .then(terminal::enter_raw_mode_scoped)
+        .then(raw_mode::enter_scoped)
         .transpose()
         .unwrap_or_else(|err| {
             warn!(?err, "failed to enter raw mote");

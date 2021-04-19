@@ -1,61 +1,32 @@
-use crate::{ioctl, prelude::*};
-use nix::unistd;
+use crate::prelude::*;
 use parking_lot::Mutex;
-use std::{mem, os::unix::prelude::AsRawFd, panic};
-
-pub(crate) fn get_window_size(fd: &impl AsRawFd) -> Result<(u16, u16)> {
-    let fd = fd.as_raw_fd();
-    let winsz = unsafe {
-        let mut winsz = mem::zeroed();
-        ioctl::tiocgwinsz(fd, &mut winsz)?;
-        winsz
-    };
-    Ok((winsz.ws_col, winsz.ws_row))
-}
-
-pub(crate) fn set_window_size(fd: &impl AsRawFd, w: u16, h: u16) -> Result<()> {
-    let fd = fd.as_raw_fd();
-    let winsz = libc::winsize {
-        ws_col: w,
-        ws_row: h,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        ioctl::tiocswinsz(fd, &winsz)?;
-    };
-    Ok(())
-}
-
-pub(crate) fn has_tty() -> bool {
-    unistd::isatty(libc::STDIN_FILENO).unwrap_or(false)
-}
+use std::panic;
 
 static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
     parking_lot::lock_api::RawMutex::INIT,
     imp::RawMode::new(libc::STDIN_FILENO),
 );
 
-pub(crate) fn enter_raw_mode() -> Result<bool> {
+pub(crate) fn enter() -> Result<bool> {
     let mut raw_mode = RAW_MODE.lock();
     let entered = raw_mode.enter()?;
     Ok(entered)
 }
 
-pub(crate) fn enter_raw_mode_scoped() -> Result<RawModeGuard> {
+pub(crate) fn enter_scoped() -> Result<RawModeGuard> {
     trace!("enter raw mode");
-    enter_raw_mode()?;
+    enter()?;
     Ok(RawModeGuard {})
 }
 
-pub(crate) fn leave_raw_mode() -> Result<bool> {
+pub(crate) fn leave() -> Result<bool> {
     let mut raw_mode = RAW_MODE.lock();
     let left = raw_mode.leave()?;
     trace!("leave raw mode");
     Ok(left)
 }
 
-pub(crate) fn leave_raw_mode_on_panic() {
+pub(crate) fn leave_on_panic() {
     let saved_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let mut raw_mode = RAW_MODE.lock();
@@ -73,7 +44,7 @@ pub(crate) struct RawModeGuard {}
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        leave_raw_mode().expect("failed to restore terminal mode");
+        leave().expect("failed to restore terminal mode");
     }
 }
 
