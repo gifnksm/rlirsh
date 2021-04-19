@@ -28,10 +28,29 @@ mod sender;
 /// Execute command
 #[derive(Debug, Clap)]
 pub(super) struct Args {
-    /// server host and port to connect
+    /// Disable pseudo-terminal allocation.
+    #[clap(name = "disable-pty", short = 'T', overrides_with = "force-enable-pty")]
+    disable_pty: bool,
+
+    /// Force pseudo-terminal allocation.
+    ///
+    /// This can be used to execute arbitrary screen-based programs on a remote machine,
+    /// which can be very useful, e.g. when implementing menu services.
+    ///
+    /// Multiple `-t` options force tty allocation, even if `rlirsh` has no local tty.
+    #[clap(
+        name = "force-enable-pty",
+        short = 't',
+        overrides_with = "disable-pty",
+        parse(from_occurrences)
+    )]
+    force_enable_pty: u32,
+
+    /// A server host and port to connect
     #[clap(parse(try_from_str = parse_addr))]
     host: SocketAddr,
-    /// command to execute on remote host
+
+    /// Commands to execute on a remote host
     command: Vec<String>,
 }
 
@@ -42,6 +61,13 @@ fn parse_addr(s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| "failed to lookup address information".into())
 }
 
+#[derive(Debug)]
+enum PtyMode {
+    Auto,
+    Disable,
+    Enable,
+}
+
 struct ServeParam {
     allocate_pty: bool,
     handle_stdin: bool,
@@ -50,6 +76,7 @@ struct ServeParam {
 }
 
 pub(super) async fn main(args: Args) -> Result<i32> {
+    trace!(?args);
     let (host, req) = create_request(args);
 
     let param = ServeParam {
@@ -85,27 +112,48 @@ pub(super) async fn main(args: Args) -> Result<i32> {
 }
 
 fn create_request(args: Args) -> (SocketAddr, ExecuteRequest) {
-    let command;
+    let pty_mode = if args.disable_pty {
+        assert_eq!(args.force_enable_pty, 0);
+        PtyMode::Disable
+    } else if args.force_enable_pty > 0 {
+        PtyMode::Enable
+    } else {
+        PtyMode::Auto
+    };
+
+    let mut allocate_pty = match pty_mode {
+        PtyMode::Auto => args.command.is_empty(),
+        PtyMode::Disable => false,
+        PtyMode::Enable => true,
+    };
+
+    let command = if args.command.is_empty() {
+        ExecuteCommand::LoginShell
+    } else {
+        ExecuteCommand::Program {
+            command: args.command,
+        }
+    };
+
+    let has_local_tty = terminal::has_tty();
+    if args.force_enable_pty < 2 && allocate_pty && !has_local_tty {
+        warn!("Pseudo-terminal will not be allocated because stdin is not a terminal.");
+        allocate_pty = false;
+    }
+
     let pty_param;
     let mut envs = vec![];
-
-    let allocate_pty = args.command.is_empty();
-
     if allocate_pty {
         let (width, height) =
             terminal::get_window_size(&libc::STDIN_FILENO).unwrap_or_else(|err| {
                 warn!(?err, "failed to get window size");
                 (80, 60)
             });
-        command = ExecuteCommand::LoginShell;
         pty_param = Some(PtyParam { width, height });
         if let Ok(term) = env::var("TERM") {
             envs.push(("TERM".into(), term));
         }
     } else {
-        command = ExecuteCommand::Program {
-            command: args.command,
-        };
         pty_param = None;
     };
 

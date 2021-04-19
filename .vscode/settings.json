@@ -12,6 +12,7 @@
         "fcntl",
         "fileno",
         "grantpt",
+        "isatty",
         "libc",
         "nonblock",
         "oneshot",

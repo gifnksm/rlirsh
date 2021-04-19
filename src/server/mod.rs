@@ -11,10 +11,10 @@ mod execute;
 /// Launch rlirsh server
 #[derive(Debug, Clap)]
 pub(super) struct Args {
-    /// alternative bind address [default: 0.0.0.0]
+    /// An alternative bind address [default: 0.0.0.0]
     #[clap(long = "bind", default_value = "0.0.0.0")]
     bind: IpAddr,
-    /// port number to bind
+    /// A port number to bind
     port: u16,
 }
 

@@ -1,4 +1,5 @@
 use crate::{ioctl, prelude::*};
+use nix::unistd;
 use parking_lot::Mutex;
 use std::{mem, os::unix::prelude::AsRawFd, panic};
 
@@ -26,6 +27,10 @@ pub(crate) fn set_window_size(fd: &impl AsRawFd, w: u16, h: u16) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn has_tty() -> bool {
+    unistd::isatty(libc::STDIN_FILENO).unwrap_or(false)
+}
+
 static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
     parking_lot::lock_api::RawMutex::INIT,
     imp::RawMode::new(libc::STDIN_FILENO),
@@ -38,6 +43,7 @@ pub(crate) fn enter_raw_mode() -> Result<bool> {
 }
 
 pub(crate) fn enter_raw_mode_scoped() -> Result<RawModeGuard> {
+    trace!("enter raw mode");
     enter_raw_mode()?;
     Ok(RawModeGuard {})
 }
@@ -45,6 +51,7 @@ pub(crate) fn enter_raw_mode_scoped() -> Result<RawModeGuard> {
 pub(crate) fn leave_raw_mode() -> Result<bool> {
     let mut raw_mode = RAW_MODE.lock();
     let left = raw_mode.leave()?;
+    trace!("leave raw mode");
     Ok(left)
 }
 
