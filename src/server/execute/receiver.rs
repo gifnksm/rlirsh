@@ -1,7 +1,7 @@
 use crate::{
     prelude::*,
     protocol::{self, C2sStreamKind, ClientAction, S2cStreamKind},
-    sink, source,
+    sink, source, terminal,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
@@ -11,11 +11,13 @@ use tokio::{
         Notify,
     },
 };
+use tokio_pty_command::PtyMaster;
 use tracing::Span;
 
 #[derive(Debug)]
 pub(super) struct Task<R> {
     reader: R,
+    pty_master: Option<PtyMaster>,
     c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
     s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
     finish_notify: Arc<Notify>,
@@ -29,6 +31,7 @@ where
 {
     pub(super) fn new(
         reader: R,
+        pty_master: Option<PtyMaster>,
         c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
         s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
         finish_notify: Arc<Notify>,
@@ -37,6 +40,7 @@ where
     ) -> Self {
         Self {
             reader,
+            pty_master,
             c2s_tx_map,
             s2c_tx_map,
             finish_notify,
@@ -54,6 +58,7 @@ where
     async fn handle(self) -> Result<()> {
         let Self {
             reader,
+            pty_master,
             c2s_tx_map,
             s2c_tx_map,
             finish_notify,
@@ -94,6 +99,16 @@ where
                     tx.send(action)
                         .instrument(info_span!("sink", ?kind))
                         .await?
+                }
+                ClientAction::WindowSizeChange(ws) => {
+                    if let Some(pty_master) = &pty_master {
+                        if let Err(err) = terminal::set_window_size(pty_master, ws.width, ws.height)
+                        {
+                            warn!(?err, "failed to set window size");
+                        }
+                    } else {
+                        warn!("PTY is not allocated");
+                    }
                 }
                 ClientAction::Finished => break,
             }

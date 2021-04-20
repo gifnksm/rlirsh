@@ -1,6 +1,7 @@
 {
     "cSpell.words": [
         "CLOEXEC",
+        "DUPFD",
         "EPERM",
         "NOCTTY",
         "RDWR",

@@ -2,7 +2,7 @@ use crate::{
     prelude::*,
     protocol::{
         self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
-        ExitStatus, PtyParam, Request, S2cStreamKind,
+        ExitStatus, PtyParam, Request, S2cStreamKind, WindowSize,
     },
     sink, source,
     stdin::Stdin,
@@ -15,15 +15,18 @@ use std::{
     env,
     fmt::Debug,
     net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
 };
 use tokio::{
     fs::File,
     net::TcpSocket,
-    sync::{mpsc, oneshot},
+    signal::unix::{signal, SignalKind},
+    sync::{mpsc, oneshot, Notify},
 };
 
 mod receiver;
 mod sender;
+mod window_change;
 
 /// Execute command
 #[derive(Debug, Clap)]
@@ -149,7 +152,9 @@ fn create_request(args: Args) -> (SocketAddr, ExecuteRequest) {
                 warn!(?err, "failed to get window size");
                 (80, 60)
             });
-        pty_param = Some(PtyParam { width, height });
+        pty_param = Some(PtyParam {
+            window_size: WindowSize { width, height },
+        });
         if let Ok(term) = env::var("TERM") {
             envs.push(("TERM".into(), term));
         }
@@ -199,6 +204,13 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let (exit_status_tx, exit_status_rx) = oneshot::channel();
     let (error_tx, error_rx) = mpsc::channel(1);
+    let exit_notify = Arc::new(Notify::new());
+
+    let window_change_stream = param
+        .allocate_pty
+        .then(|| signal(SignalKind::window_change()))
+        .transpose()
+        .wrap_err("failed to set signal handler")?;
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
@@ -238,12 +250,18 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
         handlers.push(task.spawn(info_span!("stderr")).boxed());
     }
 
+    if let Some(stream) = window_change_stream {
+        let task = window_change::Task::new(stream, send_msg_tx.clone(), exit_notify.clone());
+        handlers.push(task.spawn(info_span!("window_change_signal")).boxed());
+    }
+
     let receiver = receiver::Task::new(reader, c2s_tx_map, s2c_tx_map, exit_status_tx, error_rx)
         .spawn(info_span!("receiver"));
     let sender = sender::Task::new(writer, send_msg_rx, error_tx).spawn(info_span!("sender"));
     drop(send_msg_tx);
 
     let status = exit_status_rx.await??;
+    exit_notify.notify_waiters();
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
 
     Ok(status)

@@ -1,8 +1,14 @@
 use crate::{Error, IntoStd, Result};
 use futures_util::ready;
-use nix::{fcntl::OFlag, libc, pty, unistd};
+use nix::{
+    fcntl::{self, FcntlArg, OFlag},
+    libc, pty, unistd,
+};
 use std::{
-    os::unix::io::{AsRawFd, RawFd},
+    os::unix::{
+        io::{AsRawFd, RawFd},
+        prelude::IntoRawFd,
+    },
     pin::Pin,
     task::{Context, Poll},
 };
@@ -10,7 +16,7 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Debug)]
 pub struct PtyMaster {
-    master_fd: AsyncFd<pty::PtyMaster>,
+    master_fd: AsyncFd<RawFd>,
     slave_name: String,
 }
 
@@ -22,7 +28,7 @@ impl PtyMaster {
         pty::unlockpt(&master_fd).into_std()?;
 
         let slave_name = pty::ptsname_r(&master_fd).into_std()?;
-        let master_fd = AsyncFd::new(master_fd)?;
+        let master_fd = AsyncFd::new(master_fd.into_raw_fd())?;
 
         Ok(Self {
             master_fd,
@@ -32,6 +38,18 @@ impl PtyMaster {
 
     pub fn slave_name(&self) -> &str {
         &self.slave_name
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        let fd = fcntl::fcntl(self.as_raw_fd(), FcntlArg::F_DUPFD_CLOEXEC(0)).into_std()?;
+
+        let master_fd = AsyncFd::new(fd)?;
+        let slave_name = self.slave_name.clone();
+
+        Ok(Self {
+            master_fd,
+            slave_name,
+        })
     }
 }
 

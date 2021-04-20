@@ -22,7 +22,7 @@ libc = "0.2.93"
 nix = "0.20.0"
 parking_lot = "0.11.1"
 serde = {version = "1.0.125", features = ["derive"]}
-tokio = {version = "1.5.0", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync"]}
+tokio = {version = "1.5.0", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync"]}
 tokio-pty-command = {path = "./tokio-pty-command"}
 tracing = "0.1.25"
 tracing-error = "0.1.2"

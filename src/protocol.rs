@@ -23,6 +23,11 @@ pub(crate) enum ExecuteCommand {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct PtyParam {
+    pub(crate) window_size: WindowSize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct WindowSize {
     pub(crate) width: u16,
     pub(crate) height: u16,
 }
@@ -62,6 +67,7 @@ pub(crate) enum ServerAction {
 pub(crate) enum ClientAction {
     SourceAction(C2sStreamKind, SourceAction),
     SinkAction(S2cStreamKind, SinkAction),
+    WindowSizeChange(WindowSize),
     Finished,
 }
 

@@ -24,6 +24,7 @@ mod sender;
 
 struct ServeParam {
     child: Child,
+    pty_master: Option<PtyMaster>,
     stdin: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     stdout: Option<Box<dyn AsyncRead + Send + Unpin>>,
     stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
@@ -92,7 +93,8 @@ fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
         child = builder
             .spawn_with_pty(&pty)
             .wrap_err("failed to spawn process")?;
-        terminal::set_window_size(&pty, param.width, param.height)
+        let ws = &param.window_size;
+        terminal::set_window_size(&pty, ws.width, ws.height)
             .wrap_err("failed to set window size")?;
         pty_master = Some(pty);
     } else {
@@ -107,7 +109,10 @@ fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
     let stdin;
     let stdout;
     let stderr;
-    if let Some(pty_master) = pty_master {
+    if let Some(pty_master) = &pty_master {
+        let pty_master = pty_master
+            .try_clone()
+            .wrap_err("failed to duplicate PTY master fd")?;
         let (read, write) = io::split(pty_master);
         stdin = Some(Box::new(write) as _);
         stdout = Some(Box::new(read) as _);
@@ -120,6 +125,7 @@ fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
 
     let param = ServeParam {
         child,
+        pty_master,
         stdin,
         stdout,
         stderr,
@@ -190,6 +196,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
     let receiver = receiver::Task::new(
         reader,
+        param.pty_master,
         c2s_tx_map,
         s2c_tx_map,
         finish_notify.clone(),
