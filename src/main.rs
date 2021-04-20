@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use clap::Clap;
-use std::{process,fmt::Debug};
+use std::{fmt::Debug, process};
 
 mod execute;
 mod ioctl;
