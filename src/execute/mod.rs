@@ -15,13 +15,12 @@ use std::{
     env,
     fmt::Debug,
     net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
 };
 use tokio::{
     fs::File,
     net::TcpSocket,
     signal::unix::{signal, SignalKind},
-    sync::{mpsc, oneshot, Notify},
+    sync::{broadcast, mpsc, oneshot},
 };
 
 mod receiver;
@@ -204,7 +203,7 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let (exit_status_tx, exit_status_rx) = oneshot::channel();
     let (error_tx, error_rx) = mpsc::channel(1);
-    let exit_notify = Arc::new(Notify::new());
+    let (task_end_tx, task_end_rx) = broadcast::channel(1);
 
     let window_change_stream = param
         .allocate_pty
@@ -251,7 +250,7 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
     }
 
     if let Some(stream) = window_change_stream {
-        let task = window_change::Task::new(stream, send_msg_tx.clone(), exit_notify.clone());
+        let task = window_change::Task::new(stream, send_msg_tx.clone(), task_end_tx.subscribe());
         handlers.push(task.spawn(info_span!("window_change_signal")).boxed());
     }
 
@@ -259,9 +258,12 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
         .spawn(info_span!("receiver"));
     let sender = sender::Task::new(writer, send_msg_rx, error_tx).spawn(info_span!("sender"));
     drop(send_msg_tx);
+    drop(task_end_rx);
 
     let status = exit_status_rx.await??;
-    exit_notify.notify_waiters();
+    if let Err(err) = task_end_tx.send(()) {
+        warn!(?err, "failed to notify task end")
+    }
     tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
 
     Ok(status)

@@ -3,30 +3,29 @@ use crate::{
     protocol::{ClientAction, WindowSize},
     terminal,
 };
-use std::sync::Arc;
 use tokio::{
     signal::unix::Signal,
-    sync::{mpsc::Sender, Notify},
+    sync::{broadcast, mpsc},
 };
 use tracing::Span;
 
 #[derive(Debug)]
 pub(super) struct Task {
     stream: Signal,
-    send_msg_tx: Sender<ClientAction>,
-    exit_notify: Arc<Notify>,
+    send_msg_tx: mpsc::Sender<ClientAction>,
+    task_end_rx: broadcast::Receiver<()>,
 }
 
 impl Task {
     pub(super) fn new(
         stream: Signal,
-        send_msg_tx: Sender<ClientAction>,
-        exit_notify: Arc<Notify>,
+        send_msg_tx: mpsc::Sender<ClientAction>,
+        task_end_rx: broadcast::Receiver<()>,
     ) -> Self {
         Self {
             stream,
             send_msg_tx,
-            exit_notify,
+            task_end_rx,
         }
     }
 
@@ -40,14 +39,19 @@ impl Task {
         let Self {
             mut stream,
             send_msg_tx,
-            exit_notify,
+            mut task_end_rx,
         } = self;
 
         trace!("started");
         loop {
             tokio::select! {
                 Some(()) = stream.recv() => {}
-                () = exit_notify.notified() => break,
+                res = task_end_rx.recv() => {
+                    if let Err(err) = res {
+                        warn!(?err, "failed to receive task end signal");
+                    }
+                    break;
+                },
             }
             trace!("window change signal received");
             let (width, height) = match terminal::get_window_size(&libc::STDIN_FILENO) {
