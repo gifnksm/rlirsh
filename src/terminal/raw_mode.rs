@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use parking_lot::Mutex;
-use std::panic;
+use std::{io::Write, panic};
 
 static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
     parking_lot::lock_api::RawMutex::INIT,
@@ -8,20 +8,18 @@ static RAW_MODE: Mutex<imp::RawMode> = Mutex::const_new(
 );
 
 pub(crate) fn enter() -> Result<bool> {
-    let mut raw_mode = RAW_MODE.lock();
-    let entered = raw_mode.enter()?;
+    trace!("enter raw mode");
+    let entered = RAW_MODE.lock().enter()?;
     Ok(entered)
 }
 
 pub(crate) fn enter_scoped() -> Result<RawModeGuard> {
-    trace!("enter raw mode");
     enter()?;
     Ok(RawModeGuard {})
 }
 
 pub(crate) fn leave() -> Result<bool> {
-    let mut raw_mode = RAW_MODE.lock();
-    let left = raw_mode.leave()?;
+    let left = RAW_MODE.lock().leave()?;
     trace!("leave raw mode");
     Ok(left)
 }
@@ -29,8 +27,10 @@ pub(crate) fn leave() -> Result<bool> {
 pub(crate) fn leave_on_panic() {
     let saved_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let mut raw_mode = RAW_MODE.lock();
-        let left = raw_mode.leave().expect("failed to restore terminal mode");
+        let left = RAW_MODE
+            .lock()
+            .leave()
+            .expect("failed to restore terminal mode");
         if left {
             debug!("escape from raw mode");
         }
@@ -45,6 +45,49 @@ pub(crate) struct RawModeGuard {}
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         leave().expect("failed to restore terminal mode");
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RawModeWriter<W> {
+    inner: W,
+}
+
+impl<W> RawModeWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W> Write for RawModeWriter<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Acquire RAW_MODE lock to avoid race condition / output corruption
+        let raw_mode = RAW_MODE.lock();
+
+        let mut converted = vec![];
+        let out = if raw_mode.is_raw_mode() {
+            converted.reserve(buf.len());
+            // convert "\n" -> "\r\n"
+            for (idx, line) in buf.split(|ch| *ch == b'\n').enumerate() {
+                if idx > 0 {
+                    converted.extend_from_slice(&[b'\r', b'\n']);
+                }
+                converted.extend_from_slice(line);
+            }
+            &converted
+        } else {
+            buf
+        };
+
+        self.inner.write_all(out)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -80,6 +123,10 @@ mod imp {
             } else {
                 Ok(false)
             }
+        }
+
+        pub(crate) fn is_raw_mode(&self) -> bool {
+            self.orig.is_some()
         }
     }
 
