@@ -49,18 +49,22 @@ pub(super) struct Args {
     force_enable_pty: u32,
 
     /// A server host and port to connect
-    #[clap(parse(try_from_str = parse_addr))]
-    host: SocketAddr,
+    #[clap(name = "addr", parse(try_from_str = parse_addrs))]
+    addrs: std::vec::Vec<SocketAddr>, // avoid special treatment
 
     /// Commands to execute on a remote host
     command: Vec<String>,
 }
 
-fn parse_addr(s: &str) -> Result<SocketAddr, String> {
-    s.to_socket_addrs()
+fn parse_addrs(s: &str) -> Result<Vec<SocketAddr>, String> {
+    let addrs = s
+        .to_socket_addrs()
         .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| "failed to lookup address information".into())
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err("failed to lookup address information".into());
+    }
+    Ok(addrs)
 }
 
 #[derive(Debug)]
@@ -113,7 +117,7 @@ pub(super) async fn main(args: Args) -> Result<i32> {
     Ok(exit_code)
 }
 
-fn create_request(args: Args) -> (SocketAddr, ExecuteRequest) {
+fn create_request(args: Args) -> (Vec<SocketAddr>, ExecuteRequest) {
     let pty_mode = if args.disable_pty {
         assert_eq!(args.force_enable_pty, 0);
         PtyMode::Disable
@@ -162,7 +166,7 @@ fn create_request(args: Args) -> (SocketAddr, ExecuteRequest) {
     };
 
     (
-        args.host,
+        args.addrs,
         ExecuteRequest {
             command,
             envs,
@@ -171,17 +175,29 @@ fn create_request(args: Args) -> (SocketAddr, ExecuteRequest) {
     )
 }
 
-async fn connect(host: SocketAddr, req: ExecuteRequest) -> Result<tokio::net::TcpStream> {
-    let socket = if host.is_ipv4() {
-        TcpSocket::new_v4()
-    } else {
-        TcpSocket::new_v6()
-    }?;
+async fn connect(addrs: Vec<SocketAddr>, req: ExecuteRequest) -> Result<tokio::net::TcpStream> {
+    let mut stream = None;
+    for addr in addrs {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }?;
 
-    let mut stream = socket
-        .connect(host)
-        .await
-        .wrap_err("failed to connect to the server")?;
+        debug!(?addr, "connecting to the server");
+
+        match socket.connect(addr).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(err) => {
+                debug!(?addr, ?err, "failed to connect to the server");
+            }
+        }
+    }
+    let mut stream = stream.ok_or_else(|| eyre!("failed to connect to the server"))?;
+    debug!("connected");
 
     protocol::send_message(&mut stream, &Request::Execute(req))
         .await
