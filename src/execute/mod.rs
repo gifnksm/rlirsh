@@ -1,4 +1,5 @@
 use crate::{
+    parse,
     prelude::*,
     protocol::{
         self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
@@ -10,12 +11,7 @@ use crate::{
 };
 use clap::{AppSettings, Clap};
 use nix::libc;
-use std::{
-    collections::HashMap,
-    env,
-    fmt::Debug,
-    net::{SocketAddr, ToSocketAddrs},
-};
+use std::{collections::HashMap, env, fmt::Debug, net::SocketAddr};
 use tokio::{
     fs::File,
     net::TcpSocket,
@@ -49,23 +45,24 @@ pub(super) struct Args {
     )]
     force_enable_pty: u32,
 
+    /// Specifies that connections to the given TCP port on the local (client) host are
+    /// to be forwarded to the given host and port on the remote side.
+    ///
+    /// Format: [bind_address]:port:host:host_port
+    ///
+    /// This works by allocating a socket to listen to either a TCP port on the local side,
+    /// optionally bound to the specified `bind_address`.
+    /// Whenever a connection is made to the local port or socket, the connection is forwarded
+    /// over the insecure channel, and a connection is made to either `host` port `host_port` from the remote machine.
+    #[clap(short = 'L', number_of_values(1), parse(try_from_str = parse::local_port_forward_specifier))]
+    local_port_forward_specifier: Vec<(Vec<SocketAddr>, (String, u16))>,
+
     /// A server host and port to connect
-    #[clap(name = "addr", parse(try_from_str = parse_addrs))]
+    #[clap(name = "addr", parse(try_from_str = parse::socket_addrs))]
     addrs: std::vec::Vec<SocketAddr>, // avoid special treatment
 
     /// Commands to execute on a remote host
     command: Vec<String>,
-}
-
-fn parse_addrs(s: &str) -> Result<Vec<SocketAddr>, String> {
-    let addrs = s
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .collect::<Vec<_>>();
-    if addrs.is_empty() {
-        return Err("failed to lookup address information".into());
-    }
-    Ok(addrs)
 }
 
 #[derive(Debug)]

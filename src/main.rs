@@ -12,6 +12,7 @@ mod sink;
 mod source;
 mod stdin;
 mod terminal;
+mod parse;
 
 /// Rootless insecure remote shell
 #[derive(Debug, Clap)]
