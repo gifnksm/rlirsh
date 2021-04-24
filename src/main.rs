@@ -5,6 +5,8 @@ use terminal::raw_mode::RawModeWriter;
 
 mod execute;
 mod ioctl;
+mod net;
+mod parse;
 mod prelude;
 mod protocol;
 mod server;
@@ -12,7 +14,6 @@ mod sink;
 mod source;
 mod stdin;
 mod terminal;
-mod parse;
 
 /// Rootless insecure remote shell
 #[derive(Debug, Clap)]

@@ -1,5 +1,5 @@
 use crate::{
-    parse,
+    net, parse,
     prelude::*,
     protocol::{
         self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
@@ -14,7 +14,6 @@ use nix::libc;
 use std::{collections::HashMap, env, fmt::Debug, net::SocketAddr};
 use tokio::{
     fs::File,
-    net::TcpSocket,
     signal::unix::{signal, SignalKind},
     sync::{broadcast, mpsc, oneshot},
 };
@@ -176,21 +175,14 @@ fn create_request(args: Args) -> (Vec<SocketAddr>, ExecuteRequest) {
 async fn connect(addrs: Vec<SocketAddr>, req: ExecuteRequest) -> Result<tokio::net::TcpStream> {
     let mut stream = None;
     for addr in addrs {
-        let socket = if addr.is_ipv4() {
-            TcpSocket::new_v4()
-        } else {
-            TcpSocket::new_v6()
-        }?;
-
-        debug!(?addr, "connecting to the server");
-
-        match socket.connect(addr).await {
+        debug!(?addr, "connecting to the server...");
+        match net::connect(addr).await {
             Ok(s) => {
                 stream = Some(s);
                 break;
             }
             Err(err) => {
-                debug!(?addr, ?err, "failed to connect to the server");
+                debug!(?addr, ?err, "failed to connect to the server")
             }
         }
     }

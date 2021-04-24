@@ -1,10 +1,11 @@
 use crate::{
+    net,
     prelude::*,
     protocol::{self, Request},
 };
 use clap::Clap;
 use std::net::{IpAddr, SocketAddr};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 
 mod execute;
 
@@ -20,15 +21,7 @@ pub(super) struct Args {
 
 pub(super) async fn main(args: Args) -> Result<i32> {
     let addr = SocketAddr::new(args.bind, args.port);
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()
-    } else {
-        TcpSocket::new_v6()
-    }?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-
-    let listener = socket.listen(1024)?;
+    let listener = net::listen(addr, 1024)?;
 
     info!("start listening on {:?}", addr);
     loop {
