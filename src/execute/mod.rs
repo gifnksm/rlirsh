@@ -8,7 +8,7 @@ use crate::{
     stdin::Stdin,
     terminal::{self, raw_mode},
 };
-use clap::Clap;
+use clap::{AppSettings, Clap};
 use nix::libc;
 use std::{
     collections::HashMap,
@@ -29,6 +29,7 @@ mod window_change;
 
 /// Execute command
 #[derive(Debug, Clap)]
+#[clap(setting = AppSettings::TrailingVarArg)]
 pub(super) struct Args {
     /// Disable pseudo-terminal allocation.
     #[clap(name = "disable-pty", short = 'T', overrides_with = "force-enable-pty")]
