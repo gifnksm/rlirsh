@@ -1,7 +1,7 @@
 use crate::{
     prelude::*,
-    protocol::{ConnId, ConnecterAction, ListenerAction, PortId, StreamAction},
-    stream::RecvRouter,
+    protocol::{ConnId, ConnecterAction, ListenerAction, PortId, StreamAction, StreamId},
+    stream::{sink, source, RecvRouter},
 };
 use std::{fmt::Debug, sync::Arc};
 use tokio::{net::TcpListener, sync::mpsc};
@@ -48,7 +48,7 @@ where
         } = self;
 
         for conn_id in (0..).map(ConnId::new) {
-            let id = (port_id, conn_id);
+            let id = StreamId::Forward(port_id, conn_id);
             let (conn_tx, mut rx) = mpsc::channel(1);
             recv_router.insert_listener_tx(id, conn_tx);
             let (stream, peer_addr) = match listener.accept().await {
@@ -71,6 +71,12 @@ where
                 })?;
             recv_router.remove_listener_tx(id);
             debug!("connected");
+
+            let (reader, writer) = stream.into_split();
+            let _ = source::Task::new(id, reader, tx.clone(), &recv_router)
+                .spawn(info_span!("forward_source", ?id));
+            let _ = sink::Task::new(id, writer, tx.clone(), &recv_router)
+                .spawn(info_span!("forward_sink", ?id));
         }
 
         Ok(())

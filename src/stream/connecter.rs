@@ -1,10 +1,10 @@
 use crate::{
     net::SocketAddrs,
     prelude::*,
-    protocol::{ConnecterAction, ListenerAction, PortId, Response, StreamAction},
-    stream::RecvRouter,
+    protocol::{ConnecterAction, ListenerAction, PortId, Response, StreamAction, StreamId},
+    stream::{sink, source, RecvRouter},
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::Span;
 
@@ -29,6 +29,7 @@ pub(crate) struct Task<T> {
     addr: SocketAddrs,
     tx: mpsc::Sender<T>,
     rx: mpsc::Receiver<ListenerAction>,
+    recv_router: Arc<RecvRouter>,
 }
 
 impl<T> Task<T>
@@ -39,7 +40,7 @@ where
         port_id: PortId,
         addr: SocketAddrs,
         tx: mpsc::Sender<T>,
-        recv_router: &RecvRouter,
+        recv_router: Arc<RecvRouter>,
     ) -> Self {
         let (listen_tx, rx) = mpsc::channel(128);
         recv_router.insert_connecter_tx(port_id, Sender(listen_tx));
@@ -48,6 +49,7 @@ where
             addr,
             tx,
             rx,
+            recv_router,
         }
     }
 
@@ -63,6 +65,7 @@ where
             addr,
             tx,
             mut rx,
+            recv_router,
         } = self;
 
         trace!("started");
@@ -71,13 +74,14 @@ where
             trace!(?msg);
             match msg {
                 ListenerAction::Connect(conn_id) => {
-                    let resp_id = (port_id, conn_id);
+                    let id = StreamId::from((port_id, conn_id));
                     let addr = addr.clone();
                     let tx = tx.clone();
+                    let recv_router = recv_router.clone();
                     let _ = tokio::spawn(async move {
                         let res = addr.connect().await;
                         let resp = ConnecterAction::ConnectResponse(Response::new(&res));
-                        let msg = T::from((resp_id, resp).into());
+                        let msg = T::from((id, resp).into());
                         tx.send(msg).await?;
                         let stream = match res {
                             Ok(stream) => stream,
@@ -86,7 +90,13 @@ where
                                 bail!(err);
                             }
                         };
-                        // TODO
+
+                        let (reader, writer) = stream.into_split();
+                        let _ = source::Task::new(id, reader, tx.clone(), &recv_router)
+                            .spawn(info_span!("forward_source", ?id));
+                        let _ = sink::Task::new(id, writer, tx.clone(), &recv_router)
+                            .spawn(info_span!("forward_sink", ?id));
+
                         Ok::<(), Error>(())
                     });
                 }

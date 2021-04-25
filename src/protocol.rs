@@ -90,6 +90,7 @@ pub(crate) enum StreamId {
     Stdin,
     Stdout,
     Stderr,
+    Forward(PortId, ConnId),
 }
 
 #[derive(Debug, Deserialize, Serialize, From)]
@@ -97,7 +98,7 @@ pub(crate) enum StreamAction {
     Source(StreamId, SourceAction),
     Sink(StreamId, SinkAction),
     Listener(PortId, ListenerAction),
-    Connecter((PortId, ConnId), ConnecterAction),
+    Connecter(StreamId, ConnecterAction),
 }
 
 #[derive(Debug, Deserialize, Serialize, From)]

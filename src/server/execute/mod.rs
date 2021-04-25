@@ -199,7 +199,12 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     for (port_id, connect_addr) in (0..).map(PortId::new).zip(param.connect_addrs) {
         let send_msg_tx = send_msg_tx.clone();
         let span = info_span!("connecter", %connect_addr);
-        let task = connecter::Task::new(port_id, connect_addr, send_msg_tx.clone(), &recv_router);
+        let task = connecter::Task::new(
+            port_id,
+            connect_addr,
+            send_msg_tx.clone(),
+            recv_router.clone(),
+        );
         let _ = task.spawn(span);
     }
 

@@ -1,8 +1,7 @@
 use crate::{
     prelude::*,
     protocol::{
-        ConnId, ConnecterAction, ListenerAction, PortId, SinkAction, SourceAction, StreamAction,
-        StreamId,
+        ConnecterAction, ListenerAction, PortId, SinkAction, SourceAction, StreamAction, StreamId,
     },
     stream::{connecter, sink, source},
 };
@@ -15,7 +14,7 @@ pub(crate) struct RecvRouter {
     sink_tx_map: Mutex<HashMap<StreamId, sink::Sender>>,
     source_tx_map: Mutex<HashMap<StreamId, source::Sender>>,
     connecter_tx_map: Mutex<HashMap<PortId, connecter::Sender>>,
-    listener_tx_map: Mutex<HashMap<(PortId, ConnId), mpsc::Sender<ConnecterAction>>>,
+    listener_tx_map: Mutex<HashMap<StreamId, mpsc::Sender<ConnecterAction>>>,
 }
 
 impl RecvRouter {
@@ -35,15 +34,11 @@ impl RecvRouter {
         assert!(self.connecter_tx_map.lock().insert(id, tx).is_none())
     }
 
-    pub(crate) fn insert_listener_tx(
-        &self,
-        id: (PortId, ConnId),
-        tx: mpsc::Sender<ConnecterAction>,
-    ) {
+    pub(crate) fn insert_listener_tx(&self, id: StreamId, tx: mpsc::Sender<ConnecterAction>) {
         assert!(self.listener_tx_map.lock().insert(id, tx).is_none())
     }
 
-    pub(crate) fn remove_listener_tx(&self, id: (PortId, ConnId)) {
+    pub(crate) fn remove_listener_tx(&self, id: StreamId) {
         assert!(self.listener_tx_map.lock().remove(&id).is_some())
     }
 
@@ -121,11 +116,7 @@ impl RecvRouter {
         Ok(())
     }
 
-    async fn send_connecter_action(
-        &self,
-        id: (PortId, ConnId),
-        action: ConnecterAction,
-    ) -> Result<()> {
+    async fn send_connecter_action(&self, id: StreamId, action: ConnecterAction) -> Result<()> {
         let tx = self
             .listener_tx_map
             .lock()
