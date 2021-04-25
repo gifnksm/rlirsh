@@ -25,23 +25,23 @@ pub(super) async fn main(args: Args) -> Result<i32> {
 
     info!("start listening on {:?}", addr);
     loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                info!(%peer_addr, "connection accepted");
-                tokio::spawn(
-                    async move {
-                        if let Err(err) = serve(stream).await {
-                            warn!(?err, "serve failed");
-                        }
-                    }
-                    .instrument(info_span!("serve", %peer_addr)),
-                );
-            }
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(res) => res,
             Err(err) => {
                 warn!(?err, "accept failed");
                 continue;
             }
         };
+
+        info!(%peer_addr, "connection accepted");
+        let _ = tokio::spawn(
+            async move {
+                if let Err(err) = serve(stream).await {
+                    warn!(?err, "serve failed");
+                }
+            }
+            .instrument(info_span!("serve", %peer_addr)),
+        );
     }
 }
 

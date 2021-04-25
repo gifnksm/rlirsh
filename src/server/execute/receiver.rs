@@ -1,13 +1,13 @@
 use crate::{
     prelude::*,
-    protocol::{self, C2sStreamKind, ClientAction, S2cStreamKind},
+    protocol::{self, C2sStreamKind, ClientAction, ListenerAction, PortId, S2cStreamKind},
     sink, source, terminal,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
     io::AsyncRead,
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
         Notify,
     },
 };
@@ -20,6 +20,7 @@ pub(super) struct Task<R> {
     pty_master: Option<PtyMaster>,
     c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
     s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
+    connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
     finish_notify: Arc<Notify>,
     send_error_rx: Receiver<Error>,
     kill_error_tx: Sender<Error>,
@@ -34,6 +35,7 @@ where
         pty_master: Option<PtyMaster>,
         c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
         s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
+        connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
         finish_notify: Arc<Notify>,
         send_error_rx: Receiver<Error>,
         kill_error_tx: Sender<Error>,
@@ -43,6 +45,7 @@ where
             pty_master,
             c2s_tx_map,
             s2c_tx_map,
+            connector_tx_map,
             finish_notify,
             send_error_rx,
             kill_error_tx,
@@ -61,6 +64,7 @@ where
             pty_master,
             c2s_tx_map,
             s2c_tx_map,
+            connector_tx_map,
             finish_notify,
             mut send_error_rx,
             kill_error_tx,
@@ -109,6 +113,15 @@ where
                     } else {
                         warn!("PTY is not allocated");
                     }
+                }
+                ClientAction::ListenerAction(port_id, action) => {
+                    trace!(?port_id, ?action, "listener action received");
+                    let tx = connector_tx_map
+                        .get(&port_id)
+                        .ok_or_else(|| eyre!("tx not found: {:?}", port_id))?;
+                    tx.send(action)
+                        .instrument(info_span!("connector", ?port_id))
+                        .await?;
                 }
                 ClientAction::Finished => break,
             }

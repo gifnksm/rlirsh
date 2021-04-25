@@ -1,6 +1,8 @@
 use crate::{
     prelude::*,
-    protocol::{self, C2sStreamKind, ExitStatus, S2cStreamKind, ServerAction},
+    protocol::{
+        self, C2sStreamKind, ConnectorAction, ExitStatus, PortId, S2cStreamKind, ServerAction,
+    },
     sink, source,
 };
 use std::collections::HashMap;
@@ -15,6 +17,7 @@ pub(super) struct Task<R> {
     reader: R,
     c2s_tx_map: HashMap<C2sStreamKind, source::Sender>,
     s2c_tx_map: HashMap<S2cStreamKind, sink::Sender>,
+    listener_tx_map: HashMap<PortId, mpsc::Sender<ConnectorAction>>,
     exit_status_tx: oneshot::Sender<Result<ExitStatus>>,
     error_rx: mpsc::Receiver<Error>,
 }
@@ -27,6 +30,7 @@ where
         reader: R,
         c2s_tx_map: HashMap<C2sStreamKind, source::Sender>,
         s2c_tx_map: HashMap<S2cStreamKind, sink::Sender>,
+        listener_tx_map: HashMap<PortId, mpsc::Sender<ConnectorAction>>,
         exit_status_tx: oneshot::Sender<Result<ExitStatus>>,
         error_rx: mpsc::Receiver<Error>,
     ) -> Self {
@@ -34,6 +38,7 @@ where
             reader,
             c2s_tx_map,
             s2c_tx_map,
+            listener_tx_map,
             exit_status_tx,
             error_rx,
         }
@@ -50,6 +55,7 @@ where
             reader,
             c2s_tx_map,
             s2c_tx_map,
+            listener_tx_map,
             exit_status_tx,
             mut error_rx,
         } = self;
@@ -87,6 +93,15 @@ where
                     tx.send(action)
                         .instrument(info_span!("sink", ?kind))
                         .await?
+                }
+                ServerAction::ConnectorAction(port_id, action) => {
+                    debug!(?port_id, ?action);
+                    let tx = listener_tx_map
+                        .get(&port_id)
+                        .ok_or_else(|| eyre!("tx not found: {:?}", port_id))?;
+                    tx.send(action)
+                        .instrument(info_span!("connector", ?port_id))
+                        .await?;
                 }
                 ServerAction::Exit(status) => exit_status_tx
                     .take()

@@ -4,6 +4,43 @@ use std::{convert::TryFrom, fmt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SerialError(Vec<String>);
+
+impl SerialError {
+    pub(crate) fn new(err: &Error) -> Self {
+        Self(err.chain().map(|err| err.to_string()).collect())
+    }
+}
+
+impl From<SerialError> for Error {
+    fn from(from: SerialError) -> Self {
+        let mut err: Option<Error> = None;
+        for msg in from.0.into_iter().rev() {
+            err = Some(match err {
+                Some(e) => e.wrap_err(msg),
+                None => eyre!(msg),
+            });
+        }
+        err.unwrap_or_else(|| eyre!("failed to deserialize an error information"))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum Response {
+    Ok,
+    Err(SerialError),
+}
+
+impl From<Response> for Result<()> {
+    fn from(res: Response) -> Self {
+        match res {
+            Response::Ok => Ok(()),
+            Response::Err(err) => Err(err.into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum Request {
     Execute(ExecuteRequest),
 }
@@ -13,6 +50,7 @@ pub(crate) struct ExecuteRequest {
     pub(crate) command: ExecuteCommand,
     pub(crate) envs: Vec<(String, String)>,
     pub(crate) pty_param: Option<PtyParam>,
+    pub(crate) connect_addrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -30,12 +68,6 @@ pub(crate) struct PtyParam {
 pub(crate) struct WindowSize {
     pub(crate) width: u16,
     pub(crate) height: u16,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) enum ExecuteResponse {
-    Ok,
-    Err(String),
 }
 
 #[derive(Debug, Copy, Clone, Deserialize, Serialize)]
@@ -59,8 +91,18 @@ pub(crate) enum S2cStreamKind {
 pub(crate) enum ServerAction {
     SourceAction(S2cStreamKind, SourceAction),
     SinkAction(C2sStreamKind, SinkAction),
+    ConnectorAction(PortId, ConnectorAction),
     Exit(ExitStatus),
     Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub(crate) struct PortId(u32);
+
+impl PortId {
+    pub(crate) fn new(id: u32) -> Self {
+        Self(id)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -68,6 +110,7 @@ pub(crate) enum ClientAction {
     SourceAction(C2sStreamKind, SourceAction),
     SinkAction(S2cStreamKind, SinkAction),
     WindowSizeChange(WindowSize),
+    ListenerAction(PortId, ListenerAction),
     Finished,
 }
 
@@ -111,6 +154,25 @@ impl fmt::Debug for SourceAction {
 pub(crate) enum SinkAction {
     Ack,
     SinkClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub(crate) struct ConnId(u32);
+
+impl ConnId {
+    pub(crate) fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ListenerAction {
+    Connect(ConnId),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum ConnectorAction {
+    ConnectResponse(ConnId, Response),
 }
 
 pub(crate) const MAX_STREAM_PACKET_SIZE: usize = 4096;

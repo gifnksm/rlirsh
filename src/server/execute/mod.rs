@@ -1,8 +1,10 @@
 use crate::{
+    net::SocketAddrs,
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ExecuteCommand, ExecuteRequest, ExecuteResponse, ExitStatus,
-        S2cStreamKind, ServerAction, SinkAction, SourceAction,
+        self, C2sStreamKind, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus,
+        ListenerAction, PortId, Response, S2cStreamKind, SerialError, ServerAction, SinkAction,
+        SourceAction,
     },
     sink, source, terminal,
 };
@@ -22,32 +24,30 @@ use tokio_pty_command::{CommandExt as _, PtyMaster};
 mod receiver;
 mod sender;
 
+type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
+type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
+
 struct ServeParam {
     child: Child,
     pty_master: Option<PtyMaster>,
-    stdin: Option<Box<dyn AsyncWrite + Send + Unpin>>,
-    stdout: Option<Box<dyn AsyncRead + Send + Unpin>>,
-    stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
+    stdin: Option<BoxedWriter>,
+    stdout: Option<BoxedReader>,
+    stderr: Option<BoxedReader>,
+    connect_addrs: Vec<SocketAddrs>,
 }
 
 pub(super) async fn main(mut stream: TcpStream, req: ExecuteRequest) -> Result<()> {
     info!(?req.command, "serve request");
 
-    let res = spawn_process(req).wrap_err("failed to start process");
-    let param = match res {
-        Ok(res) => {
-            protocol::send_message(&mut stream, &ExecuteResponse::Ok)
-                .await
-                .wrap_err("failed to send response")?;
-            res
-        }
-        Err(err) => {
-            protocol::send_message(&mut stream, &ExecuteResponse::Err(err.to_string()))
-                .await
-                .wrap_err("failed to send response")?;
-            bail!(err);
-        }
+    let res = handle_request(req);
+    let resp = match &res {
+        Ok(_) => Response::Ok,
+        Err(err) => Response::Err(SerialError::new(err)),
     };
+    protocol::send_message(&mut stream, &resp)
+        .await
+        .wrap_err("failed to send response")?;
+    let param = res?;
 
     info!(id = ?param.child.id(), "spawned");
 
@@ -58,7 +58,30 @@ pub(super) async fn main(mut stream: TcpStream, req: ExecuteRequest) -> Result<(
     Ok(())
 }
 
-fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
+fn handle_request(mut req: ExecuteRequest) -> Result<ServeParam> {
+    let connect_addrs = prepare_local_forwarding(req.connect_addrs.drain(..))
+        .wrap_err("failed to prepare for local port forwarding")?;
+    let (mut child, pty_master) = spawn_process(req).wrap_err("failed to start process")?;
+    let (stdin, stdout, stderr) =
+        bind_stdio(&mut child, &pty_master).wrap_err("failed to start process")?;
+    let param = ServeParam {
+        child,
+        pty_master,
+        stdin,
+        stdout,
+        stderr,
+        connect_addrs,
+    };
+    Ok(param)
+}
+
+fn prepare_local_forwarding(
+    connect_addrs: impl IntoIterator<Item = String>,
+) -> Result<Vec<SocketAddrs>> {
+    connect_addrs.into_iter().map(|addr| addr.parse()).collect()
+}
+
+fn spawn_process(req: ExecuteRequest) -> Result<(Child, Option<PtyMaster>)> {
     let shell = if let Some(passwd) = Passwd::current_user().ok().flatten() {
         OsString::from(passwd.shell.to_str()?)
     } else if let Some(shell) = env::var_os("SHELL") {
@@ -86,7 +109,7 @@ fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
     let mut builder = Command::from(builder);
     builder.kill_on_drop(true);
 
-    let mut child;
+    let child;
     let pty_master;
     if let Some(param) = req.pty_param {
         let pty = PtyMaster::open().wrap_err("failed to open pty master")?;
@@ -106,32 +129,30 @@ fn spawn_process(req: ExecuteRequest) -> Result<ServeParam> {
         pty_master = None;
     }
 
-    let stdin;
-    let stdout;
-    let stderr;
+    Ok((child, pty_master))
+}
+
+fn bind_stdio(
+    child: &mut Child,
+    pty_master: &Option<PtyMaster>,
+) -> Result<(
+    Option<BoxedWriter>,
+    Option<BoxedReader>,
+    Option<BoxedReader>,
+)> {
     if let Some(pty_master) = &pty_master {
         let pty_master = pty_master
             .try_clone()
             .wrap_err("failed to duplicate PTY master fd")?;
         let (read, write) = io::split(pty_master);
-        stdin = Some(Box::new(write) as _);
-        stdout = Some(Box::new(read) as _);
-        stderr = None;
+        Ok((Some(Box::new(write) as _), Some(Box::new(read) as _), None))
     } else {
-        stdin = child.stdin.take().map(|x| Box::new(x) as _);
-        stdout = child.stdout.take().map(|x| Box::new(x) as _);
-        stderr = child.stderr.take().map(|x| Box::new(x) as _);
+        Ok((
+            child.stdin.take().map(|x| Box::new(x) as _),
+            child.stdout.take().map(|x| Box::new(x) as _),
+            child.stderr.take().map(|x| Box::new(x) as _),
+        ))
     }
-
-    let param = ServeParam {
-        child,
-        pty_master,
-        stdin,
-        stdout,
-        stderr,
-    };
-
-    Ok(param)
 }
 
 async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
@@ -143,6 +164,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
+    let mut connector_tx_map = HashMap::new();
     let mut handlers = vec![];
 
     if let Some(stdin) = param.stdin {
@@ -193,12 +215,53 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
             .await?;
     }
 
+    for (port_id, connect_addr) in (0..).map(PortId::new).zip(param.connect_addrs) {
+        let send_msg_tx = send_msg_tx.clone();
+        let (tx, mut rx) = mpsc::channel(128);
+        connector_tx_map.insert(port_id, tx);
+        let span = info_span!("connector", %connect_addr);
+        let _ = tokio::spawn(
+            async move {
+                debug!("start");
+                while let Some(msg) = rx.recv().await {
+                    trace!(?msg);
+                    match msg {
+                        ListenerAction::Connect(conn_id) => {
+                            let res = connect_addr.connect().await;
+                            let resp = match &res {
+                                Ok(_) => Response::Ok,
+                                Err(err) => Response::Err(SerialError::new(err)),
+                            };
+                            send_msg_tx
+                                .send(ServerAction::ConnectorAction(
+                                    port_id,
+                                    ConnectorAction::ConnectResponse(conn_id, resp),
+                                ))
+                                .await?;
+                            let _stream = match res {
+                                Ok(stream) => stream,
+                                Err(err) => {
+                                    warn!(?err);
+                                    continue;
+                                }
+                            };
+                        }
+                    }
+                }
+                debug!("finished");
+                Ok::<(), Error>(())
+            }
+            .instrument(span),
+        );
+    }
+
     let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
     let receiver = receiver::Task::new(
         reader,
         param.pty_master,
         c2s_tx_map,
         s2c_tx_map,
+        connector_tx_map,
         finish_notify.clone(),
         send_error_rx,
         kill_error_tx,

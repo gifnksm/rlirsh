@@ -1,9 +1,10 @@
 use crate::{
-    net, parse,
+    net::SocketAddrs,
+    parse,
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ClientAction, ExecuteCommand, ExecuteRequest, ExecuteResponse,
-        ExitStatus, PtyParam, Request, S2cStreamKind, WindowSize,
+        self, C2sStreamKind, ClientAction, ConnId, ConnectorAction, ExecuteCommand, ExecuteRequest,
+        ExitStatus, ListenerAction, PortId, PtyParam, Request, Response, S2cStreamKind, WindowSize,
     },
     sink, source,
     stdin::Stdin,
@@ -11,9 +12,10 @@ use crate::{
 };
 use clap::{AppSettings, Clap};
 use nix::libc;
-use std::{collections::HashMap, env, fmt::Debug, net::SocketAddr};
+use std::{collections::HashMap, env, fmt::Debug};
 use tokio::{
     fs::File,
+    net::TcpListener,
     signal::unix::{signal, SignalKind},
     sync::{broadcast, mpsc, oneshot},
 };
@@ -54,11 +56,11 @@ pub(super) struct Args {
     /// Whenever a connection is made to the local port or socket, the connection is forwarded
     /// over the insecure channel, and a connection is made to either `host` port `host_port` from the remote machine.
     #[clap(short = 'L', number_of_values(1), parse(try_from_str = parse::local_port_forward_specifier))]
-    local_port_forward_specifier: Vec<(Vec<SocketAddr>, (String, u16))>,
+    local_port_forward_specifier: Vec<(SocketAddrs, String)>,
 
     /// A server host and port to connect
-    #[clap(name = "addr", parse(try_from_str = parse::socket_addrs))]
-    addrs: std::vec::Vec<SocketAddr>, // avoid special treatment
+    #[clap(name = "addr", parse(try_from_str))]
+    addrs: SocketAddrs,
 
     /// Commands to execute on a remote host
     command: Vec<String>,
@@ -76,17 +78,21 @@ struct ServeParam {
     handle_stdin: bool,
     handle_stdout: bool,
     handle_stderr: bool,
+    local_listeners: Vec<TcpListener>,
 }
 
-pub(super) async fn main(args: Args) -> Result<i32> {
+pub(super) async fn main(mut args: Args) -> Result<i32> {
     trace!(?args);
-    let (host, req) = create_request(args);
+
+    let (local_listeners, remote_connect_addrs) = prepare_local_forwarding(&mut args)?;
+    let (host, req) = create_request(args, remote_connect_addrs);
 
     let param = ServeParam {
         allocate_pty: req.pty_param.is_some(),
         handle_stdin: true,
         handle_stdout: true,
         handle_stderr: true,
+        local_listeners,
     };
 
     let stream = connect(host, req).await?;
@@ -103,7 +109,7 @@ pub(super) async fn main(args: Args) -> Result<i32> {
             None
         });
 
-    let status = serve(stream, &param).await.wrap_err("internal error")?;
+    let status = serve(stream, param).await.wrap_err("internal error")?;
 
     debug!(?status, "command finished");
 
@@ -114,7 +120,20 @@ pub(super) async fn main(args: Args) -> Result<i32> {
     Ok(exit_code)
 }
 
-fn create_request(args: Args) -> (Vec<SocketAddr>, ExecuteRequest) {
+fn prepare_local_forwarding(args: &mut Args) -> Result<(Vec<TcpListener>, Vec<String>)> {
+    let mut local = vec![];
+    let mut remote = vec![];
+    for (local_addrs, remote_addr) in args.local_port_forward_specifier.drain(..) {
+        let listener = local_addrs
+            .listen(1024)
+            .wrap_err("failed to listen on the local address")?;
+        local.push(listener);
+        remote.push(remote_addr);
+    }
+    Ok((local, remote))
+}
+
+fn create_request(args: Args, connect_addrs: Vec<String>) -> (SocketAddrs, ExecuteRequest) {
     let pty_mode = if args.disable_pty {
         assert_eq!(args.force_enable_pty, 0);
         PtyMode::Disable
@@ -168,43 +187,32 @@ fn create_request(args: Args) -> (Vec<SocketAddr>, ExecuteRequest) {
             command,
             envs,
             pty_param,
+            connect_addrs,
         },
     )
 }
 
-async fn connect(addrs: Vec<SocketAddr>, req: ExecuteRequest) -> Result<tokio::net::TcpStream> {
-    let mut stream = None;
-    for addr in addrs {
-        debug!(?addr, "connecting to the server...");
-        match net::connect(addr).await {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(err) => {
-                debug!(?addr, ?err, "failed to connect to the server")
-            }
-        }
-    }
-    let mut stream = stream.ok_or_else(|| eyre!("failed to connect to the server"))?;
+async fn connect(addrs: SocketAddrs, req: ExecuteRequest) -> Result<tokio::net::TcpStream> {
+    let mut stream = addrs
+        .connect()
+        .await
+        .wrap_err("failed to connect to the server")?;
     debug!("connected");
 
     protocol::send_message(&mut stream, &Request::Execute(req))
         .await
         .wrap_err("failed to send request")?;
 
-    let response = protocol::recv_message(&mut stream)
+    let response: Response = protocol::recv_message(&mut stream)
         .await
         .wrap_err("failed to receive response")?;
 
-    if let ExecuteResponse::Err(message) = response {
-        bail!(eyre!(message).wrap_err("failed to execute the program"));
-    }
+    let () = Result::<()>::from(response).wrap_err("received error response from the server")?;
 
     Ok(stream)
 }
 
-async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<ExitStatus> {
+async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitStatus> {
     let (reader, writer) = stream.into_split();
     let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
     let (exit_status_tx, exit_status_rx) = oneshot::channel();
@@ -219,6 +227,7 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
 
     let mut c2s_tx_map = HashMap::new();
     let mut s2c_tx_map = HashMap::new();
+    let mut listener_tx_map = HashMap::new();
     let mut handlers = vec![];
 
     if param.handle_stdin {
@@ -260,8 +269,69 @@ async fn serve(stream: tokio::net::TcpStream, param: &ServeParam) -> Result<Exit
         handlers.push(task.spawn(info_span!("window_change_signal")).boxed());
     }
 
-    let receiver = receiver::Task::new(reader, c2s_tx_map, s2c_tx_map, exit_status_tx, error_rx)
-        .spawn(info_span!("receiver"));
+    for (port_id, local_listener) in (0..).map(PortId::new).zip(param.local_listeners) {
+        let local_addr = local_listener.local_addr()?;
+        let send_msg_tx = send_msg_tx.clone();
+        let (tx, mut rx) = mpsc::channel(128);
+        listener_tx_map.insert(port_id, tx);
+        let _ = tokio::spawn(
+            async move {
+                for conn_id in (0..).map(ConnId::new) {
+                    let (_stream, peer_addr) = match local_listener.accept().await {
+                        Ok(res) => res,
+                        Err(err) => {
+                            warn!(?err, "accept failed");
+                            continue;
+                        }
+                    };
+
+                    let send_msg_tx = send_msg_tx.clone();
+                    debug!(%peer_addr, "connection accepted");
+                    let _ = tokio::spawn(
+                        async move {
+                            debug!("start");
+                            send_msg_tx
+                                .send(ClientAction::ListenerAction(
+                                    port_id,
+                                    ListenerAction::Connect(conn_id),
+                                ))
+                                .await
+                                .wrap_err("failed to send request")?;
+                            Ok::<(), Error>(())
+                        }
+                        .instrument(info_span!("connection", %peer_addr)),
+                    );
+                    let res = rx
+                        .recv()
+                        .await
+                        .ok_or_else(|| eyre!("failed to receive message"))
+                        .and_then(|res: ConnectorAction| match res {
+                            ConnectorAction::ConnectResponse(resp_conn_id, res)
+                                if resp_conn_id == conn_id =>
+                            {
+                                Result::<()>::from(res)
+                            }
+                            _ => Err(eyre!("invalid response")),
+                        });
+                    if let Err(err) = res {
+                        warn!(?err);
+                        continue;
+                    }
+                }
+            }
+            .instrument(info_span!("listener", %local_addr)),
+        );
+    }
+
+    let receiver = receiver::Task::new(
+        reader,
+        c2s_tx_map,
+        s2c_tx_map,
+        listener_tx_map,
+        exit_status_tx,
+        error_rx,
+    )
+    .spawn(info_span!("receiver"));
     let sender = sender::Task::new(writer, send_msg_rx, error_tx).spawn(info_span!("sender"));
     drop(send_msg_tx);
     drop(task_end_rx);
