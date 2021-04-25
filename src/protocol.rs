@@ -92,7 +92,7 @@ pub(crate) enum StreamAction {
 #[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum ServerAction {
     StreamAction(StreamId, StreamAction),
-    ConnectorAction(PortId, ConnectorAction),
+    ConnecterAction(PortId, ConnecterAction),
     Exit(ExitStatus),
     Finished,
 }
@@ -171,7 +171,7 @@ pub(crate) enum ListenerAction {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) enum ConnectorAction {
+pub(crate) enum ConnecterAction {
     ConnectResponse(ConnId, Response),
 }
 

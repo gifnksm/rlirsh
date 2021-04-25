@@ -2,7 +2,7 @@ use crate::{
     net::SocketAddrs,
     prelude::*,
     protocol::{
-        self, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus, ListenerAction, PortId,
+        self, ConnecterAction, ExecuteCommand, ExecuteRequest, ExitStatus, ListenerAction, PortId,
         Response, SerialError, ServerAction, SinkAction, SourceAction, StreamId,
     },
     stream::{sink, source, RecvRouter},
@@ -163,7 +163,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     let (kill_error_tx, mut kill_error_rx) = mpsc::channel(1);
 
     let recv_router = Arc::new(RecvRouter::new());
-    let mut connector_tx_map = HashMap::new();
+    let mut connecter_tx_map = HashMap::new();
     let mut stdio_handlers = vec![];
 
     {
@@ -206,8 +206,8 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     for (port_id, connect_addr) in (0..).map(PortId::new).zip(param.connect_addrs) {
         let send_msg_tx = send_msg_tx.clone();
         let (tx, mut rx) = mpsc::channel(128);
-        connector_tx_map.insert(port_id, tx);
-        let span = info_span!("connector", %connect_addr);
+        connecter_tx_map.insert(port_id, tx);
+        let span = info_span!("connecter", %connect_addr);
         let _ = tokio::spawn(
             async move {
                 debug!("start");
@@ -221,9 +221,9 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
                                 Err(err) => Response::Err(SerialError::new(err)),
                             };
                             send_msg_tx
-                                .send(ServerAction::ConnectorAction(
+                                .send(ServerAction::ConnecterAction(
                                     port_id,
-                                    ConnectorAction::ConnectResponse(conn_id, resp),
+                                    ConnecterAction::ConnectResponse(conn_id, resp),
                                 ))
                                 .await?;
                             let _stream = match res {
@@ -247,7 +247,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
         reader,
         param.pty_master,
         recv_router.clone(),
-        connector_tx_map,
+        connecter_tx_map,
         finish_notify.clone(),
         send_error_rx,
         kill_error_tx,

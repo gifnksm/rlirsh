@@ -3,7 +3,7 @@ use crate::{
     parse,
     prelude::*,
     protocol::{
-        self, ClientAction, ConnId, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus,
+        self, ClientAction, ConnId, ConnecterAction, ExecuteCommand, ExecuteRequest, ExitStatus,
         ListenerAction, PortId, PtyParam, Request, Response, StreamId, WindowSize,
     },
     stdin::Stdin,
@@ -298,8 +298,8 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
                         .recv()
                         .await
                         .ok_or_else(|| eyre!("failed to receive message"))
-                        .and_then(|res: ConnectorAction| match res {
-                            ConnectorAction::ConnectResponse(resp_conn_id, res)
+                        .and_then(|res: ConnecterAction| match res {
+                            ConnecterAction::ConnectResponse(resp_conn_id, res)
                                 if resp_conn_id == conn_id =>
                             {
                                 Result::<()>::from(res)

@@ -20,7 +20,7 @@ pub(super) struct Task<R> {
     reader: R,
     pty_master: Option<PtyMaster>,
     recv_router: Arc<RecvRouter>,
-    connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
+    connecter_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
     finish_notify: Arc<Notify>,
     send_error_rx: Receiver<Error>,
     kill_error_tx: Sender<Error>,
@@ -34,7 +34,7 @@ where
         reader: R,
         pty_master: Option<PtyMaster>,
         recv_router: Arc<RecvRouter>,
-        connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
+        connecter_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
         finish_notify: Arc<Notify>,
         send_error_rx: Receiver<Error>,
         kill_error_tx: Sender<Error>,
@@ -43,7 +43,7 @@ where
             reader,
             pty_master,
             recv_router,
-            connector_tx_map,
+            connecter_tx_map,
             finish_notify,
             send_error_rx,
             kill_error_tx,
@@ -61,7 +61,7 @@ where
             reader,
             pty_master,
             recv_router,
-            connector_tx_map,
+            connecter_tx_map,
             finish_notify,
             mut send_error_rx,
             kill_error_tx,
@@ -100,11 +100,11 @@ where
                 }
                 ClientAction::ListenerAction(port_id, action) => {
                     trace!(?port_id, ?action, "listener action received");
-                    let tx = connector_tx_map
+                    let tx = connecter_tx_map
                         .get(&port_id)
                         .ok_or_else(|| eyre!("tx not found: {:?}", port_id))?;
                     tx.send(action)
-                        .instrument(info_span!("connector", ?port_id))
+                        .instrument(info_span!("connecter", ?port_id))
                         .await?;
                 }
                 ClientAction::Finished => break,
