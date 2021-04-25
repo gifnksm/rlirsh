@@ -1,7 +1,8 @@
 use crate::{
     prelude::*,
-    protocol::{self, C2sStreamKind, ClientAction, ListenerAction, PortId, S2cStreamKind},
-    sink, source, terminal,
+    protocol::{self, ClientAction, ListenerAction, PortId},
+    stream::RecvRouter,
+    terminal,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::{
@@ -18,8 +19,7 @@ use tracing::Span;
 pub(super) struct Task<R> {
     reader: R,
     pty_master: Option<PtyMaster>,
-    c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
-    s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
+    recv_router: Arc<RecvRouter>,
     connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
     finish_notify: Arc<Notify>,
     send_error_rx: Receiver<Error>,
@@ -33,8 +33,7 @@ where
     pub(super) fn new(
         reader: R,
         pty_master: Option<PtyMaster>,
-        c2s_tx_map: HashMap<C2sStreamKind, sink::Sender>,
-        s2c_tx_map: HashMap<S2cStreamKind, source::Sender>,
+        recv_router: Arc<RecvRouter>,
         connector_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
         finish_notify: Arc<Notify>,
         send_error_rx: Receiver<Error>,
@@ -43,8 +42,7 @@ where
         Self {
             reader,
             pty_master,
-            c2s_tx_map,
-            s2c_tx_map,
+            recv_router,
             connector_tx_map,
             finish_notify,
             send_error_rx,
@@ -62,8 +60,7 @@ where
         let Self {
             reader,
             pty_master,
-            c2s_tx_map,
-            s2c_tx_map,
+            recv_router,
             connector_tx_map,
             finish_notify,
             mut send_error_rx,
@@ -88,21 +85,8 @@ where
             };
             trace!(?message);
             match message {
-                ClientAction::SourceAction(kind, action) => {
-                    let tx = c2s_tx_map
-                        .get(&kind)
-                        .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
-                    tx.send(action)
-                        .instrument(info_span!("source", ?kind))
-                        .await?
-                }
-                ClientAction::SinkAction(kind, action) => {
-                    let tx = s2c_tx_map
-                        .get(&kind)
-                        .ok_or_else(|| eyre!("tx not found: {:?}", kind))?;
-                    tx.send(action)
-                        .instrument(info_span!("sink", ?kind))
-                        .await?
+                ClientAction::StreamAction(id, action) => {
+                    recv_router.send_stream_action(id, action).await?
                 }
                 ClientAction::WindowSizeChange(ws) => {
                     if let Some(pty_master) = &pty_master {
@@ -128,16 +112,7 @@ where
         }
         if let Some(err) = receive_failed {
             // If error occurred, shutdown all handlers on this process
-            for (kind, tx) in &s2c_tx_map {
-                if let Err(err) = tx.shutdown().instrument(info_span!("source", ?kind)).await {
-                    debug!(?err);
-                }
-            }
-            for (kind, tx) in &c2s_tx_map {
-                if let Err(err) = tx.shutdown().instrument(info_span!("client", ?kind)).await {
-                    debug!(?err);
-                }
-            }
+            recv_router.shutdown().await;
             if let Err(err) = kill_error_tx
                 .send(err.wrap_err("connection disconnected unexpectedly"))
                 .await

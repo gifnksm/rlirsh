@@ -10,9 +10,8 @@ mod parse;
 mod prelude;
 mod protocol;
 mod server;
-mod sink;
-mod source;
 mod stdin;
+mod stream;
 mod terminal;
 
 /// Rootless insecure remote shell

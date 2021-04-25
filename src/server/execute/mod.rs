@@ -2,11 +2,11 @@ use crate::{
     net::SocketAddrs,
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus,
-        ListenerAction, PortId, Response, S2cStreamKind, SerialError, ServerAction, SinkAction,
-        SourceAction,
+        self, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus, ListenerAction, PortId,
+        Response, SerialError, ServerAction, SinkAction, SourceAction, StreamId,
     },
-    sink, source, terminal,
+    stream::{sink, source, RecvRouter},
+    terminal,
 };
 use etc_passwd::Passwd;
 use std::{
@@ -162,57 +162,45 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     let (send_error_tx, send_error_rx) = mpsc::channel(1);
     let (kill_error_tx, mut kill_error_rx) = mpsc::channel(1);
 
-    let mut c2s_tx_map = HashMap::new();
-    let mut s2c_tx_map = HashMap::new();
+    let recv_router = Arc::new(RecvRouter::new());
     let mut connector_tx_map = HashMap::new();
-    let mut handlers = vec![];
+    let mut stdio_handlers = vec![];
 
-    if let Some(stdin) = param.stdin {
-        let kind = C2sStreamKind::Stdin;
-        let (tx, task) = sink::new(stdin, send_msg_tx.clone(), move |action| {
-            ServerAction::SinkAction(kind, action)
-        });
-        c2s_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stdin")).boxed());
-    } else {
-        send_msg_tx
-            .send(ServerAction::SinkAction(
-                C2sStreamKind::Stdin,
-                SinkAction::SinkClosed,
-            ))
-            .await?;
+    {
+        let id = StreamId::Stdin;
+        if let Some(stdin) = param.stdin {
+            let (tx, task) = sink::Task::new(id, stdin, send_msg_tx.clone());
+            recv_router.insert_tx(id, tx);
+            stdio_handlers.push(task.spawn(info_span!("stdin")).boxed());
+        } else {
+            send_msg_tx
+                .send((id, SinkAction::SinkClosed.into()).into())
+                .await?;
+        }
     }
-
-    if let Some(stdout) = param.stdout {
-        let kind = S2cStreamKind::Stdout;
-        let (tx, task) = source::new(stdout, send_msg_tx.clone(), move |action| {
-            ServerAction::SourceAction(kind, action)
-        });
-        s2c_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stdout")).boxed());
-    } else {
-        send_msg_tx
-            .send(ServerAction::SourceAction(
-                S2cStreamKind::Stdout,
-                SourceAction::SourceClosed,
-            ))
-            .await?;
+    {
+        let id = StreamId::Stdout;
+        if let Some(stdout) = param.stdout {
+            let (tx, task) = source::Task::new(id, stdout, send_msg_tx.clone());
+            recv_router.insert_tx(id, tx);
+            stdio_handlers.push(task.spawn(info_span!("stdout")).boxed());
+        } else {
+            send_msg_tx
+                .send((id, SourceAction::SourceClosed.into()).into())
+                .await?;
+        }
     }
-
-    if let Some(stderr) = param.stderr {
-        let kind = S2cStreamKind::Stderr;
-        let (tx, task) = source::new(stderr, send_msg_tx.clone(), move |action| {
-            ServerAction::SourceAction(kind, action)
-        });
-        s2c_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stderr")).boxed());
-    } else {
-        send_msg_tx
-            .send(ServerAction::SourceAction(
-                S2cStreamKind::Stderr,
-                SourceAction::SourceClosed,
-            ))
-            .await?;
+    {
+        let id = StreamId::Stderr;
+        if let Some(stderr) = param.stderr {
+            let (tx, task) = source::Task::new(id, stderr, send_msg_tx.clone());
+            recv_router.insert_tx(id, tx);
+            stdio_handlers.push(task.spawn(info_span!("stderr")).boxed());
+        } else {
+            send_msg_tx
+                .send((id, SourceAction::SourceClosed.into()).into())
+                .await?;
+        }
     }
 
     for (port_id, connect_addr) in (0..).map(PortId::new).zip(param.connect_addrs) {
@@ -255,12 +243,10 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
         );
     }
 
-    let c2s_kinds = c2s_tx_map.keys().copied().collect::<Vec<_>>();
     let receiver = receiver::Task::new(
         reader,
         param.pty_master,
-        c2s_tx_map,
-        s2c_tx_map,
+        recv_router.clone(),
         connector_tx_map,
         finish_notify.clone(),
         send_error_rx,
@@ -285,12 +271,10 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
             // It should be triggered by the HUP of the pipe, but the current version of tokio (1.4)
             // does not support such an operation [1], so send a message to the client to alternate it.
             // [1]: https://github.com/tokio-rs/tokio/issues/3467
-            for kind in c2s_kinds {
-                send_msg_tx
-                    .send(ServerAction::SinkAction(kind, SinkAction::SinkClosed))
-                    .await
-                    .wrap_err("failed to send message")?;
-            }
+            send_msg_tx
+                .send((StreamId::Stdin, SinkAction::SinkClosed.into()).into())
+                .await
+                .wrap_err("failed to send message")?;
             send_msg_tx.send(ServerAction::Exit(status)).await?;
         }
         Some(err) = kill_error_rx.recv() => {
@@ -302,7 +286,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     };
     drop(send_msg_tx);
 
-    tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
+    tokio::try_join!(receiver, sender, future::try_join_all(stdio_handlers))?;
 
     Ok(())
 }

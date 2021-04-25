@@ -1,6 +1,6 @@
 use crate::{
     prelude::*,
-    protocol::{SinkAction, SourceAction, MAX_STREAM_PACKET_SIZE},
+    protocol::{SinkAction, SourceAction, StreamAction, StreamId, MAX_STREAM_PACKET_SIZE},
 };
 use std::fmt::Debug;
 use tokio::{
@@ -8,23 +8,6 @@ use tokio::{
     sync::mpsc,
 };
 use tracing::Span;
-
-pub(crate) fn new<R, T, F>(
-    reader: R,
-    tx: mpsc::Sender<T>,
-    from_action: F,
-) -> (Sender, Task<R, T, F>) {
-    let (sink_tx, rx) = mpsc::channel(1);
-    (
-        Sender(sink_tx),
-        Task {
-            reader,
-            tx,
-            rx,
-            from_action,
-        },
-    )
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sender(mpsc::Sender<SinkAction>);
@@ -46,19 +29,23 @@ impl Sender {
 }
 
 #[derive(Debug)]
-pub(crate) struct Task<R, T, F> {
+pub(crate) struct Task<R, T> {
+    id: StreamId,
     reader: R,
     tx: mpsc::Sender<T>,
     rx: mpsc::Receiver<SinkAction>,
-    from_action: F,
 }
 
-impl<R, T, F> Task<R, T, F>
+impl<R, T> Task<R, T>
 where
     R: AsyncRead + Send + 'static,
-    T: Debug + Send + Sync + 'static,
-    F: Fn(SourceAction) -> T + Send + Sync + 'static,
+    T: Debug + Send + Sync + From<(StreamId, StreamAction)> + 'static,
 {
+    pub(crate) fn new(id: StreamId, reader: R, tx: mpsc::Sender<T>) -> (Sender, Self) {
+        let (sink_tx, rx) = mpsc::channel(1);
+        (Sender(sink_tx), Self { id, reader, tx, rx })
+    }
+
     pub(crate) fn spawn(self, span: Span) -> impl Future<Output = Result<()>> {
         tokio::spawn(self.handle().instrument(span))
             .err_into()
@@ -67,10 +54,10 @@ where
 
     async fn handle(self) -> Result<()> {
         let Self {
+            id,
             reader,
             tx,
             mut rx,
-            from_action,
         } = self;
         tokio::pin!(reader);
 
@@ -92,9 +79,9 @@ where
                     };
                     trace!(%size, "bytes read");
 
-                    let message = SourceAction::Data(buf[..size].into());
+                    let msg = (id, SourceAction::Data(buf[..size].into()).into()).into();
                     tx
-                        .send(from_action(message))
+                        .send(msg)
                         .await
                         .wrap_err("failed to send message")?;
                     let message = rx.recv().await.ok_or_else(|| eyre!("failed to receive message"))?;
@@ -114,9 +101,8 @@ where
                 }
             };
         }
-        tx.send(from_action(SourceAction::SourceClosed))
-            .await
-            .wrap_err("failed to send message")?;
+        let msg = (id, SourceAction::SourceClosed.into()).into();
+        tx.send(msg).await.wrap_err("failed to send message")?;
         trace!("finished");
         Ok(())
     }

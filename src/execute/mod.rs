@@ -3,16 +3,16 @@ use crate::{
     parse,
     prelude::*,
     protocol::{
-        self, C2sStreamKind, ClientAction, ConnId, ConnectorAction, ExecuteCommand, ExecuteRequest,
-        ExitStatus, ListenerAction, PortId, PtyParam, Request, Response, S2cStreamKind, WindowSize,
+        self, ClientAction, ConnId, ConnectorAction, ExecuteCommand, ExecuteRequest, ExitStatus,
+        ListenerAction, PortId, PtyParam, Request, Response, StreamId, WindowSize,
     },
-    sink, source,
     stdin::Stdin,
+    stream::{sink, source, RecvRouter},
     terminal::{self, raw_mode},
 };
 use clap::{AppSettings, Clap};
 use nix::libc;
-use std::{collections::HashMap, env, fmt::Debug};
+use std::{collections::HashMap, env, fmt::Debug, sync::Arc};
 use tokio::{
     fs::File,
     net::TcpListener,
@@ -225,48 +225,41 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
         .transpose()
         .wrap_err("failed to set signal handler")?;
 
-    let mut c2s_tx_map = HashMap::new();
-    let mut s2c_tx_map = HashMap::new();
+    let recv_router = Arc::new(RecvRouter::new());
     let mut listener_tx_map = HashMap::new();
-    let mut handlers = vec![];
+    let mut stdio_handlers = vec![];
 
     if param.handle_stdin {
-        let kind = C2sStreamKind::Stdin;
+        let id = StreamId::Stdin;
         let stdin = Stdin::new().wrap_err("failed to open stdin")?;
-        let (tx, task) = source::new(stdin, send_msg_tx.clone(), move |action| {
-            ClientAction::SourceAction(kind, action)
-        });
-        c2s_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stdin")).boxed());
+        let (tx, task) = source::Task::new(id, stdin, send_msg_tx.clone());
+        recv_router.insert_tx(id, tx);
+        stdio_handlers.push(task.spawn(info_span!("stdin")).boxed());
     }
 
     if param.handle_stdout {
-        let kind = S2cStreamKind::Stdout;
+        let id = StreamId::Stdout;
         let stdout = File::create("/dev/stdout")
             .await
             .wrap_err("failed to open stdout")?;
-        let (tx, task) = sink::new(stdout, send_msg_tx.clone(), move |action| {
-            ClientAction::SinkAction(kind, action)
-        });
-        s2c_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stdout")).boxed());
+        let (tx, task) = sink::Task::new(id, stdout, send_msg_tx.clone());
+        recv_router.insert_tx(id, tx);
+        stdio_handlers.push(task.spawn(info_span!("stdout")).boxed());
     }
 
     if param.handle_stderr {
-        let kind = S2cStreamKind::Stderr;
+        let id = StreamId::Stderr;
         let stderr = File::create("/dev/stderr")
             .await
             .wrap_err("failed to open stderr")?;
-        let (tx, task) = sink::new(stderr, send_msg_tx.clone(), move |action| {
-            ClientAction::SinkAction(kind, action)
-        });
-        s2c_tx_map.insert(kind, tx);
-        handlers.push(task.spawn(info_span!("stderr")).boxed());
+        let (tx, task) = sink::Task::new(id, stderr, send_msg_tx.clone());
+        recv_router.insert_tx(id, tx);
+        stdio_handlers.push(task.spawn(info_span!("stderr")).boxed());
     }
 
     if let Some(stream) = window_change_stream {
         let task = window_change::Task::new(stream, send_msg_tx.clone(), task_end_tx.subscribe());
-        handlers.push(task.spawn(info_span!("window_change_signal")).boxed());
+        stdio_handlers.push(task.spawn(info_span!("window_change_signal")).boxed());
     }
 
     for (port_id, local_listener) in (0..).map(PortId::new).zip(param.local_listeners) {
@@ -325,8 +318,7 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
 
     let receiver = receiver::Task::new(
         reader,
-        c2s_tx_map,
-        s2c_tx_map,
+        recv_router,
         listener_tx_map,
         exit_status_tx,
         error_rx,
@@ -340,7 +332,9 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
     if let Err(err) = task_end_tx.send(()) {
         warn!(?err, "failed to notify task end")
     }
-    tokio::try_join!(receiver, sender, future::try_join_all(handlers))?;
+    future::try_join_all(stdio_handlers).await?;
+    raw_mode::leave().wrap_err("failed to leave from raw mode")?;
+    tokio::try_join!(receiver, sender)?;
 
     Ok(status)
 }

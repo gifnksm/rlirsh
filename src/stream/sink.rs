@@ -1,6 +1,6 @@
 use crate::{
     prelude::*,
-    protocol::{SinkAction, SourceAction},
+    protocol::{SinkAction, SourceAction, StreamAction, StreamId},
 };
 use std::fmt::Debug;
 use tokio::{
@@ -8,23 +8,6 @@ use tokio::{
     sync::mpsc,
 };
 use tracing::Span;
-
-pub(crate) fn new<W, T, F>(
-    writer: W,
-    tx: mpsc::Sender<T>,
-    from_action: F,
-) -> (Sender, Task<W, T, F>) {
-    let (source_tx, rx) = mpsc::channel(1);
-    (
-        Sender(source_tx),
-        Task {
-            writer,
-            tx,
-            rx,
-            from_action,
-        },
-    )
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Sender(mpsc::Sender<SourceAction>);
@@ -43,19 +26,23 @@ impl Sender {
 }
 
 #[derive(Debug)]
-pub(crate) struct Task<W, T, F> {
+pub(crate) struct Task<W, T> {
+    id: StreamId,
     writer: W,
     tx: mpsc::Sender<T>,
     rx: mpsc::Receiver<SourceAction>,
-    from_action: F,
 }
 
-impl<W, T, F> Task<W, T, F>
+impl<W, T> Task<W, T>
 where
     W: AsyncWrite + Send + 'static,
-    T: Debug + Send + Sync + 'static,
-    F: Fn(SinkAction) -> T + Send + Sync + 'static,
+    T: Debug + Send + Sync + From<(StreamId, StreamAction)> + 'static,
 {
+    pub(crate) fn new(id: StreamId, writer: W, tx: mpsc::Sender<T>) -> (Sender, Self) {
+        let (source_tx, rx) = mpsc::channel(1);
+        (Sender(source_tx), Self { id, writer, tx, rx })
+    }
+
     pub(crate) fn spawn(self, span: Span) -> impl Future<Output = Result<()>> {
         tokio::spawn(self.handle().instrument(span))
             .err_into()
@@ -64,10 +51,10 @@ where
 
     async fn handle(self) -> Result<()> {
         let Self {
+            id,
             writer,
             tx,
             mut rx,
-            from_action,
         } = self;
         tokio::pin!(writer);
 
@@ -81,7 +68,8 @@ where
                         .instrument(info_span!("write"))
                         .await?;
                     if !is_closed {
-                        tx.send(from_action(SinkAction::Ack)).await?;
+                        let msg = (id, SinkAction::Ack.into()).into();
+                        tx.send(msg).await?;
                     }
                     do_if_not_closed(&mut is_closed, writer.flush())
                         .instrument(info_span!("flush"))
@@ -91,7 +79,8 @@ where
             }
             if is_closed {
                 // send SinkClosed each time when receiving any messages from source if sink has been closed
-                tx.send(from_action(SinkAction::SinkClosed)).await?;
+                let msg = (id, SinkAction::SinkClosed.into()).into();
+                tx.send(msg).await?;
             }
         }
         if let Err(err) = writer.shutdown().await {

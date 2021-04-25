@@ -77,20 +77,21 @@ pub(crate) enum ExitStatus {
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
-pub(crate) enum C2sStreamKind {
+pub(crate) enum StreamId {
     Stdin,
-}
-
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
-pub(crate) enum S2cStreamKind {
     Stdout,
     Stderr,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, From)]
+pub(crate) enum StreamAction {
+    SourceAction(SourceAction),
+    SinkAction(SinkAction),
+}
+
+#[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum ServerAction {
-    SourceAction(S2cStreamKind, SourceAction),
-    SinkAction(C2sStreamKind, SinkAction),
+    StreamAction(StreamId, StreamAction),
     ConnectorAction(PortId, ConnectorAction),
     Exit(ExitStatus),
     Finished,
@@ -105,10 +106,9 @@ impl PortId {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum ClientAction {
-    SourceAction(C2sStreamKind, SourceAction),
-    SinkAction(S2cStreamKind, SinkAction),
+    StreamAction(StreamId, StreamAction),
     WindowSizeChange(WindowSize),
     ListenerAction(PortId, ListenerAction),
     Finished,
