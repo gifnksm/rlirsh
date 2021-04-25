@@ -1,9 +1,9 @@
 use crate::{
     prelude::*,
-    protocol::{self, ConnecterAction, ExitStatus, PortId, ServerAction},
+    protocol::{self, ExitStatus, ServerAction},
     stream::RecvRouter,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tokio::{
     io::AsyncRead,
     sync::{mpsc, oneshot},
@@ -14,7 +14,6 @@ use tracing::Span;
 pub(super) struct Task<R> {
     reader: R,
     recv_router: Arc<RecvRouter>,
-    listener_tx_map: HashMap<PortId, mpsc::Sender<ConnecterAction>>,
     exit_status_tx: oneshot::Sender<Result<ExitStatus>>,
     error_rx: mpsc::Receiver<Error>,
 }
@@ -26,14 +25,12 @@ where
     pub(super) fn new(
         reader: R,
         recv_router: Arc<RecvRouter>,
-        listener_tx_map: HashMap<PortId, mpsc::Sender<ConnecterAction>>,
         exit_status_tx: oneshot::Sender<Result<ExitStatus>>,
         error_rx: mpsc::Receiver<Error>,
     ) -> Self {
         Self {
             reader,
             recv_router,
-            listener_tx_map,
             exit_status_tx,
             error_rx,
         }
@@ -49,7 +46,6 @@ where
         let Self {
             reader,
             recv_router,
-            listener_tx_map,
             exit_status_tx,
             mut error_rx,
         } = self;
@@ -72,18 +68,7 @@ where
             };
             trace!(?message);
             match message {
-                ServerAction::StreamAction(id, action) => {
-                    recv_router.send_stream_action(id, action).await?
-                }
-                ServerAction::ConnecterAction(port_id, action) => {
-                    debug!(?port_id, ?action);
-                    let tx = listener_tx_map
-                        .get(&port_id)
-                        .ok_or_else(|| eyre!("tx not found: {:?}", port_id))?;
-                    tx.send(action)
-                        .instrument(info_span!("connecter", ?port_id))
-                        .await?;
-                }
+                ServerAction::Stream(action) => recv_router.send_stream_action(action).await?,
                 ServerAction::Exit(status) => exit_status_tx
                     .take()
                     .ok_or_else(|| eyre!("received exit status multiple times"))?

@@ -1,6 +1,7 @@
 use crate::{
     prelude::*,
     protocol::{SinkAction, SourceAction, StreamAction, StreamId},
+    stream::RecvRouter,
 };
 use std::fmt::Debug;
 use tokio::{
@@ -36,11 +37,17 @@ pub(crate) struct Task<W, T> {
 impl<W, T> Task<W, T>
 where
     W: AsyncWrite + Send + 'static,
-    T: Debug + Send + Sync + From<(StreamId, StreamAction)> + 'static,
+    T: Debug + Send + Sync + From<StreamAction> + 'static,
 {
-    pub(crate) fn new(id: StreamId, writer: W, tx: mpsc::Sender<T>) -> (Sender, Self) {
+    pub(crate) fn new(
+        id: StreamId,
+        writer: W,
+        tx: mpsc::Sender<T>,
+        recv_router: &RecvRouter,
+    ) -> Self {
         let (source_tx, rx) = mpsc::channel(1);
-        (Sender(source_tx), Self { id, writer, tx, rx })
+        recv_router.insert_sink_tx(id, Sender(source_tx));
+        Self { id, writer, tx, rx }
     }
 
     pub(crate) fn spawn(self, span: Span) -> impl Future<Output = Result<()>> {
@@ -68,7 +75,7 @@ where
                         .instrument(info_span!("write"))
                         .await?;
                     if !is_closed {
-                        let msg = (id, SinkAction::Ack.into()).into();
+                        let msg = T::from((id, SinkAction::Ack).into());
                         tx.send(msg).await?;
                     }
                     do_if_not_closed(&mut is_closed, writer.flush())
@@ -79,7 +86,7 @@ where
             }
             if is_closed {
                 // send SinkClosed each time when receiving any messages from source if sink has been closed
-                let msg = (id, SinkAction::SinkClosed.into()).into();
+                let msg = T::from((id, SinkAction::SinkClosed).into());
                 tx.send(msg).await?;
             }
         }

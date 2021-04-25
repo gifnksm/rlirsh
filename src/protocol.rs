@@ -31,6 +31,15 @@ pub(crate) enum Response {
     Err(SerialError),
 }
 
+impl Response {
+    pub(crate) fn new<T>(res: &Result<T>) -> Self {
+        match res {
+            Ok(_) => Self::Ok,
+            Err(err) => Self::Err(SerialError::new(err)),
+        }
+    }
+}
+
 impl From<Response> for Result<()> {
     fn from(res: Response) -> Self {
         match res {
@@ -76,7 +85,7 @@ pub(crate) enum ExitStatus {
     Signal(i32),
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, From, Deserialize, Serialize)]
 pub(crate) enum StreamId {
     Stdin,
     Stdout,
@@ -85,14 +94,15 @@ pub(crate) enum StreamId {
 
 #[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum StreamAction {
-    SourceAction(SourceAction),
-    SinkAction(SinkAction),
+    Source(StreamId, SourceAction),
+    Sink(StreamId, SinkAction),
+    Listener(PortId, ListenerAction),
+    Connecter((PortId, ConnId), ConnecterAction),
 }
 
 #[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum ServerAction {
-    StreamAction(StreamId, StreamAction),
-    ConnecterAction(PortId, ConnecterAction),
+    Stream(StreamAction),
     Exit(ExitStatus),
     Finished,
 }
@@ -108,9 +118,8 @@ impl PortId {
 
 #[derive(Debug, Deserialize, Serialize, From)]
 pub(crate) enum ClientAction {
-    StreamAction(StreamId, StreamAction),
+    Stream(StreamAction),
     WindowSizeChange(WindowSize),
-    ListenerAction(PortId, ListenerAction),
     Finished,
 }
 
@@ -172,7 +181,7 @@ pub(crate) enum ListenerAction {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum ConnecterAction {
-    ConnectResponse(ConnId, Response),
+    ConnectResponse(Response),
 }
 
 pub(crate) const MAX_STREAM_PACKET_SIZE: usize = 4096;

@@ -1,14 +1,14 @@
 use crate::{
     prelude::*,
-    protocol::{self, ClientAction, ListenerAction, PortId},
+    protocol::{self, ClientAction},
     stream::RecvRouter,
     terminal,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tokio::{
     io::AsyncRead,
     sync::{
-        mpsc::{self, Receiver, Sender},
+        mpsc::{Receiver, Sender},
         Notify,
     },
 };
@@ -20,7 +20,6 @@ pub(super) struct Task<R> {
     reader: R,
     pty_master: Option<PtyMaster>,
     recv_router: Arc<RecvRouter>,
-    connecter_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
     finish_notify: Arc<Notify>,
     send_error_rx: Receiver<Error>,
     kill_error_tx: Sender<Error>,
@@ -34,7 +33,6 @@ where
         reader: R,
         pty_master: Option<PtyMaster>,
         recv_router: Arc<RecvRouter>,
-        connecter_tx_map: HashMap<PortId, mpsc::Sender<ListenerAction>>,
         finish_notify: Arc<Notify>,
         send_error_rx: Receiver<Error>,
         kill_error_tx: Sender<Error>,
@@ -43,7 +41,6 @@ where
             reader,
             pty_master,
             recv_router,
-            connecter_tx_map,
             finish_notify,
             send_error_rx,
             kill_error_tx,
@@ -61,7 +58,6 @@ where
             reader,
             pty_master,
             recv_router,
-            connecter_tx_map,
             finish_notify,
             mut send_error_rx,
             kill_error_tx,
@@ -85,9 +81,7 @@ where
             };
             trace!(?message);
             match message {
-                ClientAction::StreamAction(id, action) => {
-                    recv_router.send_stream_action(id, action).await?
-                }
+                ClientAction::Stream(action) => recv_router.send_stream_action(action).await?,
                 ClientAction::WindowSizeChange(ws) => {
                     if let Some(pty_master) = &pty_master {
                         if let Err(err) = terminal::set_window_size(pty_master, ws.width, ws.height)
@@ -97,15 +91,6 @@ where
                     } else {
                         warn!("PTY is not allocated");
                     }
-                }
-                ClientAction::ListenerAction(port_id, action) => {
-                    trace!(?port_id, ?action, "listener action received");
-                    let tx = connecter_tx_map
-                        .get(&port_id)
-                        .ok_or_else(|| eyre!("tx not found: {:?}", port_id))?;
-                    tx.send(action)
-                        .instrument(info_span!("connecter", ?port_id))
-                        .await?;
                 }
                 ClientAction::Finished => break,
             }

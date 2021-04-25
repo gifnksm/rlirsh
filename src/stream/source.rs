@@ -1,6 +1,7 @@
 use crate::{
     prelude::*,
     protocol::{SinkAction, SourceAction, StreamAction, StreamId, MAX_STREAM_PACKET_SIZE},
+    stream::RecvRouter,
 };
 use std::fmt::Debug;
 use tokio::{
@@ -39,11 +40,17 @@ pub(crate) struct Task<R, T> {
 impl<R, T> Task<R, T>
 where
     R: AsyncRead + Send + 'static,
-    T: Debug + Send + Sync + From<(StreamId, StreamAction)> + 'static,
+    T: Debug + Send + Sync + From<StreamAction> + 'static,
 {
-    pub(crate) fn new(id: StreamId, reader: R, tx: mpsc::Sender<T>) -> (Sender, Self) {
+    pub(crate) fn new(
+        id: StreamId,
+        reader: R,
+        tx: mpsc::Sender<T>,
+        recv_router: &RecvRouter,
+    ) -> Self {
         let (sink_tx, rx) = mpsc::channel(1);
-        (Sender(sink_tx), Self { id, reader, tx, rx })
+        recv_router.insert_source_tx(id, Sender(sink_tx));
+        Self { id, reader, tx, rx }
     }
 
     pub(crate) fn spawn(self, span: Span) -> impl Future<Output = Result<()>> {
@@ -79,7 +86,7 @@ where
                     };
                     trace!(%size, "bytes read");
 
-                    let msg = (id, SourceAction::Data(buf[..size].into()).into()).into();
+                    let msg = T::from((id, SourceAction::Data(buf[..size].into())).into());
                     tx
                         .send(msg)
                         .await
@@ -101,7 +108,7 @@ where
                 }
             };
         }
-        let msg = (id, SourceAction::SourceClosed.into()).into();
+        let msg = T::from((id, SourceAction::SourceClosed).into());
         tx.send(msg).await.wrap_err("failed to send message")?;
         trace!("finished");
         Ok(())

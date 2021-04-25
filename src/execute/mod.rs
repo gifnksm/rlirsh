@@ -3,16 +3,16 @@ use crate::{
     parse,
     prelude::*,
     protocol::{
-        self, ClientAction, ConnId, ConnecterAction, ExecuteCommand, ExecuteRequest, ExitStatus,
-        ListenerAction, PortId, PtyParam, Request, Response, StreamId, WindowSize,
+        self, ExecuteCommand, ExecuteRequest, ExitStatus, PortId, PtyParam, Request, Response,
+        StreamId, WindowSize,
     },
     stdin::Stdin,
-    stream::{sink, source, RecvRouter},
+    stream::{listener, sink, source, RecvRouter},
     terminal::{self, raw_mode},
 };
 use clap::{AppSettings, Clap};
 use nix::libc;
-use std::{collections::HashMap, env, fmt::Debug, sync::Arc};
+use std::{env, fmt::Debug, sync::Arc};
 use tokio::{
     fs::File,
     net::TcpListener,
@@ -226,14 +226,12 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
         .wrap_err("failed to set signal handler")?;
 
     let recv_router = Arc::new(RecvRouter::new());
-    let mut listener_tx_map = HashMap::new();
     let mut stdio_handlers = vec![];
 
     if param.handle_stdin {
         let id = StreamId::Stdin;
         let stdin = Stdin::new().wrap_err("failed to open stdin")?;
-        let (tx, task) = source::Task::new(id, stdin, send_msg_tx.clone());
-        recv_router.insert_tx(id, tx);
+        let task = source::Task::new(id, stdin, send_msg_tx.clone(), &recv_router);
         stdio_handlers.push(task.spawn(info_span!("stdin")).boxed());
     }
 
@@ -242,8 +240,7 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
         let stdout = File::create("/dev/stdout")
             .await
             .wrap_err("failed to open stdout")?;
-        let (tx, task) = sink::Task::new(id, stdout, send_msg_tx.clone());
-        recv_router.insert_tx(id, tx);
+        let task = sink::Task::new(id, stdout, send_msg_tx.clone(), &recv_router);
         stdio_handlers.push(task.spawn(info_span!("stdout")).boxed());
     }
 
@@ -252,8 +249,7 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
         let stderr = File::create("/dev/stderr")
             .await
             .wrap_err("failed to open stderr")?;
-        let (tx, task) = sink::Task::new(id, stderr, send_msg_tx.clone());
-        recv_router.insert_tx(id, tx);
+        let task = sink::Task::new(id, stderr, send_msg_tx.clone(), &recv_router);
         stdio_handlers.push(task.spawn(info_span!("stderr")).boxed());
     }
 
@@ -264,66 +260,17 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
 
     for (port_id, local_listener) in (0..).map(PortId::new).zip(param.local_listeners) {
         let local_addr = local_listener.local_addr()?;
-        let send_msg_tx = send_msg_tx.clone();
-        let (tx, mut rx) = mpsc::channel(128);
-        listener_tx_map.insert(port_id, tx);
-        let _ = tokio::spawn(
-            async move {
-                for conn_id in (0..).map(ConnId::new) {
-                    let (_stream, peer_addr) = match local_listener.accept().await {
-                        Ok(res) => res,
-                        Err(err) => {
-                            warn!(?err, "accept failed");
-                            continue;
-                        }
-                    };
-
-                    let send_msg_tx = send_msg_tx.clone();
-                    debug!(%peer_addr, "connection accepted");
-                    let _ = tokio::spawn(
-                        async move {
-                            debug!("start");
-                            send_msg_tx
-                                .send(ClientAction::ListenerAction(
-                                    port_id,
-                                    ListenerAction::Connect(conn_id),
-                                ))
-                                .await
-                                .wrap_err("failed to send request")?;
-                            Ok::<(), Error>(())
-                        }
-                        .instrument(info_span!("connection", %peer_addr)),
-                    );
-                    let res = rx
-                        .recv()
-                        .await
-                        .ok_or_else(|| eyre!("failed to receive message"))
-                        .and_then(|res: ConnecterAction| match res {
-                            ConnecterAction::ConnectResponse(resp_conn_id, res)
-                                if resp_conn_id == conn_id =>
-                            {
-                                Result::<()>::from(res)
-                            }
-                            _ => Err(eyre!("invalid response")),
-                        });
-                    if let Err(err) = res {
-                        warn!(?err);
-                        continue;
-                    }
-                }
-            }
-            .instrument(info_span!("listener", %local_addr)),
+        let task = listener::Task::new(
+            port_id,
+            local_listener,
+            send_msg_tx.clone(),
+            recv_router.clone(),
         );
+        let _ = task.spawn(info_span!("listener", %local_addr));
     }
 
-    let receiver = receiver::Task::new(
-        reader,
-        recv_router,
-        listener_tx_map,
-        exit_status_tx,
-        error_rx,
-    )
-    .spawn(info_span!("receiver"));
+    let receiver = receiver::Task::new(reader, recv_router, exit_status_tx, error_rx)
+        .spawn(info_span!("receiver"));
     let sender = sender::Task::new(writer, send_msg_rx, error_tx).spawn(info_span!("sender"));
     drop(send_msg_tx);
     drop(task_end_rx);

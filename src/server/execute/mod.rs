@@ -2,16 +2,16 @@ use crate::{
     net::SocketAddrs,
     prelude::*,
     protocol::{
-        self, ConnecterAction, ExecuteCommand, ExecuteRequest, ExitStatus, ListenerAction, PortId,
-        Response, SerialError, ServerAction, SinkAction, SourceAction, StreamId,
+        self, ExecuteCommand, ExecuteRequest, ExitStatus, PortId, Response, ServerAction,
+        SinkAction, SourceAction, StreamAction, StreamId,
     },
-    stream::{sink, source, RecvRouter},
+    stream::{connecter, sink, source, RecvRouter},
     terminal,
 };
 use etc_passwd::Passwd;
 use std::{
-    collections::HashMap, env, ffi::OsString, os::unix::prelude::ExitStatusExt,
-    os::unix::process::CommandExt, process::Command as StdCommand, process::Stdio, sync::Arc,
+    env, ffi::OsString, os::unix::prelude::ExitStatusExt, os::unix::process::CommandExt,
+    process::Command as StdCommand, process::Stdio, sync::Arc,
 };
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
@@ -40,10 +40,7 @@ pub(super) async fn main(mut stream: TcpStream, req: ExecuteRequest) -> Result<(
     info!(?req.command, "serve request");
 
     let res = handle_request(req);
-    let resp = match &res {
-        Ok(_) => Response::Ok,
-        Err(err) => Response::Err(SerialError::new(err)),
-    };
+    let resp = Response::new(&res);
     protocol::send_message(&mut stream, &resp)
         .await
         .wrap_err("failed to send response")?;
@@ -157,97 +154,59 @@ fn bind_stdio(
 
 async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
     let (reader, writer) = stream.into_split();
-    let (send_msg_tx, send_msg_rx) = mpsc::channel(128);
+    let (send_msg_tx, send_msg_rx) = mpsc::channel::<ServerAction>(128);
     let finish_notify = Arc::new(Notify::new());
     let (send_error_tx, send_error_rx) = mpsc::channel(1);
     let (kill_error_tx, mut kill_error_rx) = mpsc::channel(1);
 
     let recv_router = Arc::new(RecvRouter::new());
-    let mut connecter_tx_map = HashMap::new();
     let mut stdio_handlers = vec![];
 
     {
         let id = StreamId::Stdin;
         if let Some(stdin) = param.stdin {
-            let (tx, task) = sink::Task::new(id, stdin, send_msg_tx.clone());
-            recv_router.insert_tx(id, tx);
+            let task = sink::Task::new(id, stdin, send_msg_tx.clone(), &recv_router);
             stdio_handlers.push(task.spawn(info_span!("stdin")).boxed());
         } else {
             send_msg_tx
-                .send((id, SinkAction::SinkClosed.into()).into())
+                .send(StreamAction::from((id, SinkAction::SinkClosed)).into())
                 .await?;
         }
     }
     {
         let id = StreamId::Stdout;
         if let Some(stdout) = param.stdout {
-            let (tx, task) = source::Task::new(id, stdout, send_msg_tx.clone());
-            recv_router.insert_tx(id, tx);
+            let task = source::Task::new(id, stdout, send_msg_tx.clone(), &recv_router);
             stdio_handlers.push(task.spawn(info_span!("stdout")).boxed());
         } else {
             send_msg_tx
-                .send((id, SourceAction::SourceClosed.into()).into())
+                .send(StreamAction::from((id, SourceAction::SourceClosed)).into())
                 .await?;
         }
     }
     {
         let id = StreamId::Stderr;
         if let Some(stderr) = param.stderr {
-            let (tx, task) = source::Task::new(id, stderr, send_msg_tx.clone());
-            recv_router.insert_tx(id, tx);
+            let task = source::Task::new(id, stderr, send_msg_tx.clone(), &recv_router);
             stdio_handlers.push(task.spawn(info_span!("stderr")).boxed());
         } else {
             send_msg_tx
-                .send((id, SourceAction::SourceClosed.into()).into())
+                .send(StreamAction::from((id, SourceAction::SourceClosed)).into())
                 .await?;
         }
     }
 
     for (port_id, connect_addr) in (0..).map(PortId::new).zip(param.connect_addrs) {
         let send_msg_tx = send_msg_tx.clone();
-        let (tx, mut rx) = mpsc::channel(128);
-        connecter_tx_map.insert(port_id, tx);
         let span = info_span!("connecter", %connect_addr);
-        let _ = tokio::spawn(
-            async move {
-                debug!("start");
-                while let Some(msg) = rx.recv().await {
-                    trace!(?msg);
-                    match msg {
-                        ListenerAction::Connect(conn_id) => {
-                            let res = connect_addr.connect().await;
-                            let resp = match &res {
-                                Ok(_) => Response::Ok,
-                                Err(err) => Response::Err(SerialError::new(err)),
-                            };
-                            send_msg_tx
-                                .send(ServerAction::ConnecterAction(
-                                    port_id,
-                                    ConnecterAction::ConnectResponse(conn_id, resp),
-                                ))
-                                .await?;
-                            let _stream = match res {
-                                Ok(stream) => stream,
-                                Err(err) => {
-                                    warn!(?err);
-                                    continue;
-                                }
-                            };
-                        }
-                    }
-                }
-                debug!("finished");
-                Ok::<(), Error>(())
-            }
-            .instrument(span),
-        );
+        let task = connecter::Task::new(port_id, connect_addr, send_msg_tx.clone(), &recv_router);
+        let _ = task.spawn(span);
     }
 
     let receiver = receiver::Task::new(
         reader,
         param.pty_master,
         recv_router.clone(),
-        connecter_tx_map,
         finish_notify.clone(),
         send_error_rx,
         kill_error_tx,
@@ -272,7 +231,7 @@ async fn serve(stream: TcpStream, mut param: ServeParam) -> Result<()> {
             // does not support such an operation [1], so send a message to the client to alternate it.
             // [1]: https://github.com/tokio-rs/tokio/issues/3467
             send_msg_tx
-                .send((StreamId::Stdin, SinkAction::SinkClosed.into()).into())
+                .send(StreamAction::from((StreamId::Stdin, SinkAction::SinkClosed)).into())
                 .await
                 .wrap_err("failed to send message")?;
             send_msg_tx.send(ServerAction::Exit(status)).await?;
