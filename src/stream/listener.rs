@@ -82,13 +82,18 @@ where
                 .send(T::from((port_id, req).into()))
                 .await
                 .wrap_err("failed to send request")?;
-            rx.recv()
+            let res = rx
+                .recv()
                 .await
                 .ok_or_else(|| eyre!("failed to receive response"))
                 .and_then(|res| match res {
                     ConnecterAction::ConnectResponse(res) => Result::<()>::from(res),
-                })?;
+                });
             recv_router.remove_listener_tx(id);
+            if let Err(err) = res {
+                warn!(?err);
+                continue;
+            }
             debug!("connected");
 
             let (reader, writer) = stream.into_split();
