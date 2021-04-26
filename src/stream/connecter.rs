@@ -100,6 +100,7 @@ where
                         Ok::<(), Error>(())
                     });
                 }
+                ListenerAction::ListenerClosed => break,
             }
         }
 

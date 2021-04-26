@@ -178,6 +178,7 @@ impl ConnId {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum ListenerAction {
     Connect(ConnId),
+    ListenerClosed,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

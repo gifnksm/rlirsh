@@ -264,6 +264,7 @@ async fn serve(stream: tokio::net::TcpStream, param: ServeParam) -> Result<ExitS
             port_id,
             local_listener,
             send_msg_tx.clone(),
+            task_end_tx.subscribe(),
             recv_router.clone(),
         );
         let _ = task.spawn(info_span!("listener", %local_addr));
