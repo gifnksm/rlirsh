@@ -3,9 +3,9 @@ use crate::{
     protocol::{ConnId, ConnecterAction, ListenerAction, PortId, StreamAction, StreamId},
     stream::{sink, source, RecvRouter},
 };
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
 };
 use tracing::Span;
@@ -58,37 +58,19 @@ where
 
         for conn_id in (0..).map(ConnId::new) {
             let id = StreamId::Forward(port_id, conn_id);
-            let (conn_tx, mut rx) = mpsc::channel(1);
-            recv_router.insert_listener_tx(id, conn_tx);
-            let res = tokio::select! {
-                res = listener.accept() => res,
-                res = task_end_rx.recv() => {
-                    if let Err(err) = res {
-                        warn!(?err, "failed to receive task end signal");
-                    }
-                    break;
-                },
-            };
-            let (stream, peer_addr) = match res {
-                Ok(res) => res,
+            let (stream, peer_addr) = match Self::accept(&listener, &mut task_end_rx).await {
+                Ok(Some(res)) => res,
+                Ok(None) => break,
                 Err(err) => {
                     warn!(?conn_id, ?err, "accept failed");
                     continue;
                 }
             };
-            debug!(%peer_addr, ?conn_id, "connection accepted");
-            let req = ListenerAction::Connect(conn_id);
-            send_msg_tx
-                .send(T::from((port_id, req).into()))
-                .await
-                .wrap_err("failed to send request")?;
-            let res = rx
-                .recv()
-                .await
-                .ok_or_else(|| eyre!("failed to receive response"))
-                .and_then(|res| match res {
-                    ConnecterAction::ConnectResponse(res) => Result::<()>::from(res),
-                });
+            debug!(%peer_addr, ?conn_id, "accepted");
+
+            let (conn_tx, mut rx) = mpsc::channel(1);
+            recv_router.insert_listener_tx(id, conn_tx);
+            let res = Self::connect_remote(port_id, conn_id, &mut rx, &send_msg_tx).await;
             recv_router.remove_listener_tx(id);
             if let Err(err) = res {
                 warn!(?err);
@@ -111,6 +93,44 @@ where
 
         debug!("finish");
 
+        Ok(())
+    }
+
+    async fn accept(
+        listener: &TcpListener,
+        task_end_rx: &mut broadcast::Receiver<()>,
+    ) -> Result<Option<(TcpStream, SocketAddr)>> {
+        tokio::select! {
+            res = listener.accept() => match res {
+                Ok(res) => Ok(Some(res)),
+                Err(err) => bail!(err),
+            },
+            res = task_end_rx.recv() => {
+                if let Err(err) = res {
+                    warn!(?err, "failed to receive task end signal");
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    async fn connect_remote(
+        port_id: PortId,
+        conn_id: ConnId,
+        rx: &mut mpsc::Receiver<ConnecterAction>,
+        send_msg_tx: &mpsc::Sender<T>,
+    ) -> Result<()> {
+        let req = ListenerAction::Connect(conn_id);
+        send_msg_tx
+            .send(T::from((port_id, req).into()))
+            .await
+            .wrap_err("failed to send request")?;
+        rx.recv()
+            .await
+            .ok_or_else(|| eyre!("failed to receive response"))
+            .and_then(|res| match res {
+                ConnecterAction::ConnectResponse(res) => Result::<()>::from(res),
+            })?;
         Ok(())
     }
 }

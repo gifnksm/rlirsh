@@ -74,31 +74,13 @@ where
             trace!(?msg);
             match msg {
                 ListenerAction::Connect(conn_id) => {
-                    let id = StreamId::from((port_id, conn_id));
-                    let addr = addr.clone();
-                    let tx = tx.clone();
-                    let recv_router = recv_router.clone();
-                    let _ = tokio::spawn(async move {
-                        let res = addr.connect().await;
-                        let resp = ConnecterAction::ConnectResponse(Response::new(&res));
-                        let msg = T::from((id, resp).into());
-                        tx.send(msg).await?;
-                        let stream = match res {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                warn!(?err);
-                                bail!(err);
-                            }
-                        };
-
-                        let (reader, writer) = stream.into_split();
-                        let _ = source::Task::new(id, reader, tx.clone(), &recv_router)
-                            .spawn(info_span!("forward_source", ?id));
-                        let _ = sink::Task::new(id, writer, tx.clone(), &recv_router)
-                            .spawn(info_span!("forward_sink", ?id));
-
-                        Ok::<(), Error>(())
-                    });
+                    Self::connect(
+                        StreamId::from((port_id, conn_id)),
+                        addr.clone(),
+                        tx.clone(),
+                        recv_router.clone(),
+                    )
+                    .await?;
                 }
                 ListenerAction::ListenerClosed => break,
             }
@@ -106,6 +88,36 @@ where
 
         trace!("finished");
 
+        Ok(())
+    }
+
+    async fn connect(
+        id: StreamId,
+        addr: SocketAddrs,
+        tx: mpsc::Sender<T>,
+        recv_router: Arc<RecvRouter>,
+    ) -> Result<()> {
+        let _ = tokio::spawn(async move {
+            let res = addr.connect().await;
+            let resp = ConnecterAction::ConnectResponse(Response::new(&res));
+            let msg = T::from((id, resp).into());
+            tx.send(msg).await?;
+            let stream = match res {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(?err);
+                    bail!(err);
+                }
+            };
+
+            let (reader, writer) = stream.into_split();
+            let _ = source::Task::new(id, reader, tx.clone(), &recv_router)
+                .spawn(info_span!("forward_source", ?id));
+            let _ = sink::Task::new(id, writer, tx.clone(), &recv_router)
+                .spawn(info_span!("forward_sink", ?id));
+
+            Ok::<(), Error>(())
+        });
         Ok(())
     }
 }
